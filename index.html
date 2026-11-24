@@ -67,7 +67,7 @@
         const todayISO = () => isoLocal(new Date());
         const parseISO = (iso) => { const [y, m, d] = iso.split('-').map(Number); return new Date(y, m - 1, d); };
         const fmtDate = (iso) => { if (!iso) return '—'; const [y, m, d] = iso.split('-'); return `${d}/${m}/${y}`; };
-        // Días hábiles: excluye sábados y domingos. NO excluye festivos (nacionales, de Galicia ni locales de Marín).
+        // Días hábiles: excluye sábados y domingos. NO excluye festivos (nacionales y regionales).
         const addBusinessDays = (iso, days) => {
             const dt = parseISO(iso); let added = 0;
             while (added < days) { dt.setDate(dt.getDate() + 1); const wd = dt.getDay(); if (wd !== 0 && wd !== 6) added++; }
@@ -1280,7 +1280,7 @@
                                 {db.clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                             </select>
                         </Field>
-                        <Field label="Matrícula *"><input required value={f.license_plate} onChange={(e) => { setError(''); setF({ ...f, license_plate: e.target.value.toUpperCase() }); }} className={`${inputCls} font-mono`} placeholder="1234 ABC" /></Field>
+                        <Field label="Matrícula *"><input required value={f.license_plate} onChange={(e) => { setError(''); setF({ ...f, license_plate: e.target.value.toUpperCase() }); }} className={`${inputCls} font-mono`} placeholder="DEMO 001" /></Field>
                         <div className="grid grid-cols-2 gap-3">
                             <Field label="Marca"><input value={f.brand} onChange={(e) => setF({ ...f, brand: e.target.value })} className={inputCls} /></Field>
                             <Field label="Modelo"><input value={f.model} onChange={(e) => setF({ ...f, model: e.target.value })} className={inputCls} /></Field>
