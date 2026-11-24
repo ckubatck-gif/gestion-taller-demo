@@ -228,7 +228,10 @@
         const btnDanger = 'bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors';
 
         function Logo({ settings, className = 'w-10 h-10' }) {
-            return <img src={settings.logo || DEFAULT_LOGO} alt={`Logotipo de ${settings.name}`} className={`object-contain ${className}`} />;
+            if (settings.logo) {
+                return <img src={settings.logo} alt={`Logotipo de ${settings.name}`} className={`object-contain ${className}`} />;
+            }
+            return <div role="img" aria-label={`Identidad de ${settings.name}`} className={`flex items-center justify-center rounded-lg bg-white text-orange-500 text-2xl ${className}`}>🔧</div>;
         }
 
         function Field({ label, hint, children, className = '' }) {
@@ -1551,7 +1554,7 @@
                             <div className="space-y-2">
                                 <input ref={logoInput} type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" onChange={onLogo} className="hidden" />
                                 <button className={btnPrimary} onClick={() => logoInput.current.click()}>Cambiar logo</button>
-                                {s.logo && <button className={`${btnSecondary} ml-2`} onClick={() => api.setSettings({ logo: null })}>Volver al logo original</button>}
+                                {s.logo && <button className={`${btnSecondary} ml-2`} onClick={() => api.setSettings({ logo: null })}>Quitar logo personalizado</button>}
                                 <p className="text-[11px] text-slate-500">PNG con fondo transparente o SVG, máximo 700 KB. Sale en la aplicación y en los documentos impresos.</p>
                             </div>
                         </div>
