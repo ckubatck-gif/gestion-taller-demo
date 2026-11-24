@@ -1,0 +1,1594 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gestión de Taller · Demo</title>
+    <!-- Tailwind por CDN: válido para prueba/prototipo. En la versión final se compila. -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: { extend: { colors: { slate: { 850: '#151f32', 900: '#0f172a', 950: '#090d16' } } } }
+        }
+    </script>
+    <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+    <style>
+        @page { size: A4; margin: 12mm; }
+        .doc-sheet { font-size: 12px; line-height: 1.4; }
+        /* RD 1457/1986 art. 12.3: cláusulas con letra de al menos 1,5 mm de altura */
+        .doc-legal { font-size: 11px; line-height: 1.4; }
+        @media print {
+            html, body { background: #fff !important; height: auto !important; overflow: visible !important; }
+            .app-shell, .no-print { display: none !important; }
+            .doc-overlay { position: static !important; inset: auto !important; background: #fff !important; padding: 0 !important; overflow: visible !important; }
+            .doc-sheet { box-shadow: none !important; margin: 0 !important; max-width: none !important; border-radius: 0 !important; padding: 0 !important; }
+            .avoid-break { break-inside: avoid; }
+        }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 font-sans">
+    <div id="root"></div>
+
+    <script type="text/babel" data-presets="react">
+        const { useState, useMemo, useEffect, useRef } = React;
+
+        // =====================================================================
+        // CONSTANTES Y UTILIDADES
+        // =====================================================================
+        const STORAGE_KEY = 'faciamtech-gestion-taller-demo-v1';
+        const DATA_VERSION = 1;
+        // Logotipo oficial del taller (PNG transparente). Se puede sustituir desde Ajustes.
+        const DEFAULT_LOGO = ''; // Identidad genérica: sin logotipo del antiguo taller.
+
+        const STATUSES = ['Pendiente de presupuesto', 'Presupuesto entregado', 'Aceptado', 'En curso', 'Terminada', 'Entregada', 'Rechazado'];
+        // Estados que implican trabajar en el coche: exigen presupuesto aceptado o renuncia escrita (RD 1457/1986, art. 14.5)
+        const NEEDS_CONSENT = ['En curso', 'Terminada', 'Entregada'];
+        const CLOSED = ['Terminada', 'Entregada'];
+        const WORKER_STATUSES = ['Activo', 'De vacaciones', 'De baja', 'Inactivo'];
+
+        const STATUS_STYLE = {
+            'Pendiente de presupuesto': 'bg-slate-700/40 text-slate-300 border-slate-600',
+            'Presupuesto entregado': 'bg-sky-500/10 text-sky-300 border-sky-500/30',
+            'Aceptado': 'bg-violet-500/10 text-violet-300 border-violet-500/30',
+            'En curso': 'bg-amber-500/10 text-amber-300 border-amber-500/30',
+            'Terminada': 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30',
+            'Entregada': 'bg-emerald-500/20 text-emerald-200 border-emerald-500/40',
+            'Rechazado': 'bg-rose-500/10 text-rose-300 border-rose-500/30',
+        };
+
+        const n = (v) => { const x = Number(v); return Number.isFinite(x) ? x : 0; };
+        const round2 = (x) => Math.round((x + Number.EPSILON) * 100) / 100;
+        const eur = (x) => new Intl.NumberFormat('es-ES', { style: 'currency', currency: 'EUR' }).format(n(x));
+        const num = (x) => new Intl.NumberFormat('es-ES', { maximumFractionDigits: 2 }).format(n(x));
+        const pad = (x) => String(x).padStart(2, '0');
+        const isoLocal = (dt) => `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
+        const todayISO = () => isoLocal(new Date());
+        const parseISO = (iso) => { const [y, m, d] = iso.split('-').map(Number); return new Date(y, m - 1, d); };
+        const fmtDate = (iso) => { if (!iso) return '—'; const [y, m, d] = iso.split('-'); return `${d}/${m}/${y}`; };
+        // Días hábiles: excluye sábados y domingos. NO excluye festivos (nacionales, de Galicia ni locales de Marín).
+        const addBusinessDays = (iso, days) => {
+            const dt = parseISO(iso); let added = 0;
+            while (added < days) { dt.setDate(dt.getDate() + 1); const wd = dt.getDay(); if (wd !== 0 && wd !== 6) added++; }
+            return isoLocal(dt);
+        };
+        const addMonths = (iso, months) => { const dt = parseISO(iso); dt.setMonth(dt.getMonth() + months); return isoLocal(dt); };
+        const monthRange = () => { const d = new Date(); return [isoLocal(new Date(d.getFullYear(), d.getMonth(), 1)), isoLocal(new Date(d.getFullYear(), d.getMonth() + 1, 0))]; };
+        const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        const nextNumber = (prefix, existing, year) => {
+            const re = new RegExp(`^${prefix}-${year}-(\\d+)$`);
+            let max = 0;
+            existing.forEach(s => { const m = re.exec(s || ''); if (m) max = Math.max(max, Number(m[1])); });
+            return `${prefix}-${year}-${String(max + 1).padStart(4, '0')}`;
+        };
+
+        // =====================================================================
+        // DATOS POR DEFECTO, CARGA Y GUARDADO
+        // =====================================================================
+        const DEFAULT_SETTINGS = {
+            name: 'Gestión de Taller',
+            nif: '—',
+            address: 'Dirección ficticia · España',
+            phone: '',
+            email: '',
+            regNumber: '',
+            hourRate: 42,
+            ivaRate: 21,
+            validityDays: 12,
+            logo: null,
+        };
+
+        const emptyDb = (settings) => ({
+            version: DATA_VERSION, demo: false,
+            settings: { ...DEFAULT_SETTINGS, ...(settings || {}) },
+            workers: [], clients: [], vehicles: [], orders: [], tasks: [], parts: [], hidden: [],
+        });
+
+        const newOrderFields = () => ({
+            return_parts: true, budget_number: null, budget_date: null, budget_accepted_date: null,
+            budget_snapshot: null, budget_waived: false, budget_waived_date: null,
+            close_date: null, delivery_date: null, final_amount: '', notes: '',
+        });
+
+        function buildDemo() {
+            const db = {
+                version: DATA_VERSION, demo: true,
+                settings: { ...DEFAULT_SETTINGS },
+                workers: [
+                    { id: 'demo-worker-1', name: 'Alex Mecánico', cost_hour: 18, status: 'Activo' },
+                    { id: 'demo-worker-2', name: 'Sam Taller', cost_hour: 21, status: 'De vacaciones' },
+                ],
+                clients: [
+                    { id: 'demo-client-1', name: 'Cliente Ejemplo Uno', nif: '—', address: 'Zona norte', phone: '', email: '' },
+                    { id: 'demo-client-2', name: 'Cliente Ejemplo Dos', nif: '—', address: 'Zona centro', phone: '', email: '' },
+                ],
+                vehicles: [
+                    { id: 'demo-vehicle-1', client_id: 'demo-client-1', license_plate: 'DEMO 001', brand: 'Ford', model: 'Transit', year: 2020 },
+                    { id: 'demo-vehicle-2', client_id: 'demo-client-2', license_plate: 'DEMO 002', brand: 'Toyota', model: 'Corolla', year: 2022 },
+                ],
+                orders: [
+                    { id: 'demo-order-1', number: 'OR-DEMO-001', vehicle_id: 'demo-vehicle-1', status: 'Entregada', open_date: '2026-11-02', km: '85000',
+                      customer_request: 'Revisión periódica y comprobación de frenos', deposit_for: 'reparación', expected_date: '2026-11-05', expected_days: 3,
+                      ...newOrderFields(), budget_number: 'PRE-DEMO-001', budget_date: '2026-11-02', budget_accepted_date: '2026-11-02',
+                      close_date: '2026-11-05', delivery_date: '2026-11-05' },
+                    { id: 'demo-order-2', number: 'OR-DEMO-002', vehicle_id: 'demo-vehicle-2', status: 'Pendiente de presupuesto', open_date: '2026-11-20', km: '42000',
+                      customer_request: 'Diagnóstico de testigo de motor', deposit_for: 'presupuesto', expected_date: '2026-11-24', expected_days: 2,
+                      ...newOrderFields() },
+                ],
+                tasks: [
+                    { id: 'demo-task-1', order_id: 'demo-order-1', description: 'Revisión general', worker_id: 'demo-worker-1', hours_budget: 2, hours_real: 2 },
+                    { id: 'demo-task-2', order_id: 'demo-order-1', description: 'Comprobación de frenos', worker_id: 'demo-worker-2', hours_budget: 1, hours_real: 1.25 },
+                ],
+                parts: [
+                    { id: 'demo-part-1', order_id: 'demo-order-1', description: 'Aceite sintético 5W30', brand: 'Marca Demo', supplier: '', quantity: 1, unit_cost: 28, unit_price: 39 },
+                    { id: 'demo-part-2', order_id: 'demo-order-1', description: 'Filtro de aceite', brand: 'Marca Demo', supplier: '', quantity: 1, unit_cost: 9, unit_price: 16 },
+                ],
+                hidden: [],
+            };
+            db.orders[0].budget_snapshot = makeSnapshot(db, 'demo-order-1', '2026-11-02');
+            return db;
+        }
+
+        const isValidDb = (p) => p && typeof p === 'object' && ['settings', 'workers', 'clients', 'vehicles', 'orders', 'tasks', 'parts'].every(k => Array.isArray(p[k]) || (k === 'settings' && typeof p[k] === 'object'));
+        const normalize = (p) => ({ ...emptyDb(), ...p, settings: { ...DEFAULT_SETTINGS, ...p.settings }, hidden: Array.isArray(p.hidden) ? p.hidden : [] });
+
+        function loadInitial() {
+            try {
+                const raw = localStorage.getItem(STORAGE_KEY);
+                if (raw) { const p = JSON.parse(raw); if (isValidDb(p)) return normalize(p); }
+            } catch (e) { /* almacenamiento no disponible: se usan datos de ejemplo */ }
+            return buildDemo();
+        }
+
+        // =====================================================================
+        // CÁLCULOS (todos los importes de venta, SIN IVA)
+        // =====================================================================
+        function makeSnapshot(db, orderId, date) {
+            const rate = n(db.settings.hourRate), ivaRate = n(db.settings.ivaRate);
+            const labor = db.tasks.filter(t => t.order_id === orderId).map(t => ({
+                desc: t.description, hours: n(t.hours_budget), rate, amount: round2(n(t.hours_budget) * rate),
+            }));
+            const parts = db.parts.filter(p => p.order_id === orderId).map(p => ({
+                desc: p.description, brand: p.brand || '', qty: n(p.quantity), price: n(p.unit_price), amount: round2(n(p.quantity) * n(p.unit_price)),
+            }));
+            const base = round2([...labor, ...parts].reduce((a, l) => a + l.amount, 0));
+            const iva = round2(base * ivaRate / 100);
+            return { date, rate, ivaRate, labor, parts, base, iva, total: round2(base + iva) };
+        }
+
+        function orderCalc(db, orderId) {
+            const s = db.settings;
+            const rate = n(s.hourRate), ivaRate = n(s.ivaRate);
+            const order = db.orders.find(o => o.id === orderId);
+            const tasks = db.tasks.filter(t => t.order_id === orderId);
+            const parts = db.parts.filter(p => p.order_id === orderId);
+            const hidden = db.hidden.filter(h => h.order_id === orderId);
+
+            const laborReal = round2(tasks.reduce((a, t) => a + n(t.hours_real) * rate, 0));
+            const partsSale = round2(parts.reduce((a, p) => a + n(p.quantity) * n(p.unit_price), 0));
+            const laborCost = round2(tasks.reduce((a, t) => {
+                const w = db.workers.find(w => w.id === t.worker_id);
+                return a + n(t.hours_real) * (w ? n(w.cost_hour) : 0);
+            }, 0));
+            const partsCost = round2(parts.reduce((a, p) => a + n(p.quantity) * n(p.unit_cost), 0));
+
+            const computedBase = round2(laborReal + partsSale);
+            const hasOverride = order && order.final_amount !== '' && order.final_amount !== null && order.final_amount !== undefined;
+            const billedBase = hasOverride ? round2(n(order.final_amount)) : computedBase;
+            const iva = round2(billedBase * ivaRate / 100);
+            const cost = round2(laborCost + partsCost);
+
+            const acceptedHidden = round2(hidden.filter(h => h.accepted === true).reduce((a, h) => a + n(h.amount), 0));
+            const budgetBase = order && order.budget_snapshot ? order.budget_snapshot.base : null;
+            // Límite: presupuesto aceptado + averías ocultas aceptadas (art. 14.6 y 16.7)
+            const limit = budgetBase !== null ? round2(budgetBase + acceptedHidden) : null;
+
+            return {
+                rate, ivaRate, laborReal, partsSale, laborCost, partsCost, cost, computedBase, hasOverride,
+                billedBase, iva, total: round2(billedBase + iva), profit: round2(billedBase - cost),
+                margin: billedBase > 0 ? round2((billedBase - cost) / billedBase * 100) : null,
+                budgetBase, acceptedHidden, limit, overLimit: limit !== null && billedBase > limit + 0.005,
+            };
+        }
+
+        const orderContext = (db, order) => {
+            const vehicle = db.vehicles.find(v => v.id === order.vehicle_id);
+            const client = vehicle ? db.clients.find(c => c.id === vehicle.client_id) : null;
+            return { vehicle, client };
+        };
+
+        // =====================================================================
+        // COMPONENTES DE INTERFAZ BÁSICOS
+        // =====================================================================
+        const inputCls = 'w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-orange-500';
+        const cellCls = 'w-full bg-slate-900 border border-slate-800 rounded-md px-2 py-1.5 text-xs text-white focus:outline-none focus:border-orange-500';
+        const btnPrimary = 'bg-orange-500 hover:bg-orange-600 text-slate-950 px-4 py-2 rounded-lg text-sm font-bold transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
+        const btnSecondary = 'bg-slate-800 hover:bg-slate-700 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
+        const btnDanger = 'bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors';
+
+        function Logo({ settings, className = 'w-10 h-10' }) {
+            return <img src={settings.logo || DEFAULT_LOGO} alt={`Logotipo de ${settings.name}`} className={`object-contain ${className}`} />;
+        }
+
+        function Field({ label, hint, children, className = '' }) {
+            return (
+                <label className={`block ${className}`}>
+                    <span className="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">{label}</span>
+                    {children}
+                    {hint && <span className="block text-[11px] text-slate-500 mt-1">{hint}</span>}
+                </label>
+            );
+        }
+
+        function Card({ title, right, children, className = '' }) {
+            return (
+                <section className={`bg-slate-900 border border-slate-800 rounded-2xl p-5 ${className}`}>
+                    {(title || right) && (
+                        <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+                            {title && <h3 className="font-bold text-white text-sm">{title}</h3>}
+                            {right}
+                        </div>
+                    )}
+                    {children}
+                </section>
+            );
+        }
+
+        function StatusBadge({ status }) {
+            return <span className={`inline-block px-2 py-0.5 rounded-full text-[11px] font-bold border ${STATUS_STYLE[status] || STATUS_STYLE['Pendiente de presupuesto']}`}>{status}</span>;
+        }
+
+        function Modal({ title, onClose, children, wide }) {
+            return (
+                <div className="fixed inset-0 z-40 bg-slate-950/80 flex items-center justify-center p-4" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+                    <div className={`bg-slate-900 border border-slate-800 w-full ${wide ? 'max-w-2xl' : 'max-w-md'} rounded-2xl p-6 shadow-2xl max-h-[90vh] overflow-y-auto`}>
+                        <div className="flex justify-between items-center mb-4">
+                            <h3 className="font-bold text-lg text-white">{title}</h3>
+                            <button onClick={onClose} className="text-slate-400 hover:text-white text-xl leading-none" aria-label="Cerrar">×</button>
+                        </div>
+                        {children}
+                    </div>
+                </div>
+            );
+        }
+
+        function ConfirmModal({ state, onCancel }) {
+            return (
+                <Modal title={state.title} onClose={onCancel}>
+                    <p className="text-sm text-slate-300 whitespace-pre-line">{state.message}</p>
+                    <div className="flex justify-end gap-3 mt-6">
+                        <button className={btnSecondary} onClick={onCancel}>Cancelar</button>
+                        <button className={state.danger ? btnDanger : btnPrimary} onClick={() => { state.onConfirm(); onCancel(); }}>{state.confirmLabel || 'Confirmar'}</button>
+                    </div>
+                </Modal>
+            );
+        }
+
+        function Toast({ toast, onClose }) {
+            const color = toast.type === 'error' ? 'bg-rose-600' : 'bg-emerald-600';
+            return (
+                <div className={`no-print fixed bottom-4 right-4 z-[60] max-w-sm ${color} text-white text-sm rounded-xl shadow-2xl px-4 py-3 flex gap-3 items-start`}>
+                    <span className="flex-1">{toast.text}</span>
+                    <button onClick={onClose} className="font-bold" aria-label="Cerrar aviso">×</button>
+                </div>
+            );
+        }
+
+        // =====================================================================
+        // APLICACIÓN
+        // =====================================================================
+        const TABS = [
+            { id: 'panel', label: 'Panel', icon: '📊' },
+            { id: 'orders', label: 'Órdenes', icon: '🔧' },
+            { id: 'clients', label: 'Clientes y vehículos', icon: '👥' },
+            { id: 'workers', label: 'Trabajadores', icon: '👷' },
+            { id: 'reports', label: 'Rentabilidad', icon: '📈' },
+            { id: 'settings', label: 'Ajustes', icon: '⚙️' },
+        ];
+
+        function App() {
+            const [db, setDb] = useState(loadInitial);
+            const [tab, setTab] = useState('panel');
+            const [selectedOrderId, setSelectedOrderId] = useState(null);
+            const [doc, setDoc] = useState(null);
+            const [modal, setModal] = useState(null); // {type, data}
+            const [confirmState, setConfirmState] = useState(null);
+            const [toast, setToast] = useState(null);
+            const [saveError, setSaveError] = useState(false);
+
+            useEffect(() => {
+                try { localStorage.setItem(STORAGE_KEY, JSON.stringify(db)); setSaveError(false); }
+                catch (e) { setSaveError(true); }
+            }, [db]);
+
+            useEffect(() => {
+                if (!toast) return;
+                const t = setTimeout(() => setToast(null), 5000);
+                return () => clearTimeout(t);
+            }, [toast]);
+
+            // --- Operaciones genéricas ---
+            const setSettings = (changes) => setDb(prev => ({ ...prev, settings: { ...prev.settings, ...changes } }));
+            const upd = (key, id, changes) => setDb(prev => ({ ...prev, [key]: prev[key].map(x => x.id === id ? { ...x, ...changes } : x) }));
+            const add = (key, item) => { const id = uid(); setDb(prev => ({ ...prev, [key]: [...prev[key], { ...item, id }] })); return id; };
+            const del = (key, id) => setDb(prev => ({ ...prev, [key]: prev[key].filter(x => x.id !== id) }));
+            const ask = (state) => setConfirmState(state);
+            const notify = (text, type = 'ok') => setToast({ text, type });
+
+            // --- Órdenes ---
+            const createOrder = (form) => {
+                const id = uid();
+                setDb(prev => {
+                    const number = nextNumber('OR', prev.orders.map(o => o.number), form.open_date.slice(0, 4));
+                    return { ...prev, orders: [...prev.orders, { id, number, status: 'Pendiente de presupuesto', ...form, ...newOrderFields() }] };
+                });
+                setTab('orders'); setSelectedOrderId(id);
+            };
+
+            const changeStatus = (order, status) => {
+                if (NEEDS_CONSENT.includes(status) && !order.budget_accepted_date && !order.budget_waived) {
+                    notify('No se puede empezar la reparación sin presupuesto aceptado y firmado o renuncia escrita del cliente (RD 1457/1986, art. 14.5).', 'error');
+                    return;
+                }
+                const changes = { status };
+                const t = todayISO();
+                if (CLOSED.includes(status) && !order.close_date) changes.close_date = t;
+                if (status === 'Entregada' && !order.delivery_date) changes.delivery_date = t;
+                upd('orders', order.id, changes);
+            };
+
+            const generateBudget = (order) => setDb(prev => {
+                const t = todayISO();
+                const number = nextNumber('PRE', prev.orders.map(o => o.budget_number), t.slice(0, 4));
+                return { ...prev, orders: prev.orders.map(o => o.id === order.id ? {
+                    ...o, budget_number: number, budget_date: t,
+                    status: o.status === 'Pendiente de presupuesto' ? 'Presupuesto entregado' : o.status,
+                } : o) };
+            });
+
+            const acceptBudget = (order, date) => setDb(prev => {
+                const snap = makeSnapshot(prev, order.id, date);
+                return { ...prev, orders: prev.orders.map(o => o.id === order.id ? { ...o, budget_accepted_date: date, budget_snapshot: snap, status: 'Aceptado' } : o) };
+            });
+
+            const undoAcceptance = (order) => upd('orders', order.id, {
+                budget_accepted_date: null, budget_snapshot: null, budget_waived: false, budget_waived_date: null,
+                status: order.budget_number ? 'Presupuesto entregado' : 'Pendiente de presupuesto',
+            });
+
+            const deleteOrder = (order) => {
+                setDb(prev => ({
+                    ...prev,
+                    orders: prev.orders.filter(o => o.id !== order.id),
+                    tasks: prev.tasks.filter(t => t.order_id !== order.id),
+                    parts: prev.parts.filter(p => p.order_id !== order.id),
+                    hidden: prev.hidden.filter(h => h.order_id !== order.id),
+                }));
+                setSelectedOrderId(null);
+            };
+
+            const api = { setSettings, upd, add, del, ask, notify, setDb, createOrder, changeStatus, generateBudget, acceptBudget, undoAcceptance, deleteOrder, setModal, setDoc };
+
+            const openOrder = (id) => { setTab('orders'); setSelectedOrderId(id); };
+            const goTab = (id) => { setTab(id); setSelectedOrderId(null); };
+            const selectedOrder = selectedOrderId ? db.orders.find(o => o.id === selectedOrderId) : null;
+
+            return (
+                <>
+                    <div className="app-shell flex h-screen overflow-hidden bg-slate-950">
+                        {/* Barra lateral (escritorio) */}
+                        <aside className="hidden md:flex w-64 bg-slate-900 border-r border-slate-800 flex-col">
+                            <div className="p-4 border-b border-slate-800 flex items-center gap-3">
+                                <Logo settings={db.settings} className="w-14 h-12 flex-shrink-0 rounded-lg bg-white p-1" />
+                                <div className="min-w-0">
+                                    <h1 className="font-bold text-xs leading-tight text-white truncate">{db.settings.name}</h1>
+                                    <p className="text-[10px] text-orange-500 font-semibold">Gestión de taller</p>
+                                </div>
+                            </div>
+                            <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
+                                {TABS.map(t => (
+                                    <button key={t.id} onClick={() => goTab(t.id)}
+                                        className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm transition-all ${tab === t.id && !selectedOrder ? 'bg-orange-500 text-slate-950 font-bold' : tab === t.id ? 'bg-slate-800 text-white font-semibold' : 'text-slate-400 hover:bg-slate-800 hover:text-white'}`}>
+                                        <span className="text-base" aria-hidden="true">{t.icon}</span><span>{t.label}</span>
+                                    </button>
+                                ))}
+                            </nav>
+                            <div className="p-4 border-t border-slate-800 text-[11px] text-slate-500 text-center">NIF {db.settings.nif}</div>
+                        </aside>
+
+                        <main className="flex-1 flex flex-col overflow-hidden">
+                            <header className="bg-slate-900 border-b border-slate-800 px-4 md:px-6 py-3 flex items-center justify-between gap-3">
+                                <div className="flex md:hidden items-center gap-2 min-w-0">
+                                    <Logo settings={db.settings} className="w-11 h-9 rounded-md flex-shrink-0 bg-white p-0.5" />
+                                    <span className="font-bold text-sm truncate">{db.settings.name}</span>
+                                </div>
+                                <span className="hidden md:inline text-xs uppercase tracking-widest text-orange-500 font-bold bg-orange-500/10 px-3 py-1 rounded-full border border-orange-500/20">
+                                    {selectedOrder ? `Orden ${selectedOrder.number}` : TABS.find(t => t.id === tab).label}
+                                </span>
+                                <button onClick={() => setModal({ type: 'order' })} className={btnPrimary}>+ Nueva orden</button>
+                            </header>
+                            {/* Pestañas (móvil) */}
+                            <nav className="md:hidden flex gap-1 overflow-x-auto bg-slate-900 border-b border-slate-800 px-2 py-2">
+                                {TABS.map(t => (
+                                    <button key={t.id} onClick={() => goTab(t.id)} className={`whitespace-nowrap px-3 py-1.5 rounded-lg text-xs font-semibold ${tab === t.id ? 'bg-orange-500 text-slate-950' : 'text-slate-400 bg-slate-800'}`}>
+                                        {t.icon} {t.label}
+                                    </button>
+                                ))}
+                            </nav>
+
+                            <div className="bg-amber-500/10 border-b border-amber-500/30 text-amber-200 text-xs px-4 md:px-6 py-2">
+                                <strong>Versión de demostración.</strong> Todos los nombres, matrículas, importes y registros son ficticios. Los datos se guardan únicamente en este navegador. No introduzcas información real.
+                            </div>
+                            {saveError && (
+                                <div className="bg-rose-600/20 border-b border-rose-500/40 text-rose-200 text-xs px-4 md:px-6 py-2">
+                                    ⚠️ Este navegador no permite guardar los datos (modo privado o almacenamiento lleno). Lo que hagas se perderá al cerrar. Exporta una copia desde Ajustes.
+                                </div>
+                            )}
+
+                            <div className="flex-1 overflow-y-auto p-4 md:p-6">
+                                {selectedOrder ? (
+                                    <OrderDetail db={db} order={selectedOrder} api={api} onBack={() => setSelectedOrderId(null)} />
+                                ) : tab === 'panel' ? <Panel db={db} openOrder={openOrder} />
+                                  : tab === 'orders' ? <OrdersList db={db} openOrder={openOrder} api={api} />
+                                  : tab === 'clients' ? <Clients db={db} api={api} />
+                                  : tab === 'workers' ? <Workers db={db} api={api} />
+                                  : tab === 'reports' ? <Reports db={db} openOrder={openOrder} />
+                                  : <Settings db={db} api={api} />}
+                            </div>
+                        </main>
+                    </div>
+
+                    {doc && <DocumentView db={db} doc={doc} onClose={() => setDoc(null)} notify={notify} />}
+                    {modal?.type === 'order' && <OrderModal db={db} onClose={() => setModal(null)} onSave={createOrder} goClients={() => { setModal(null); goTab('clients'); }} />}
+                    {modal?.type === 'client' && <ClientModal client={modal.data} onClose={() => setModal(null)} api={api} />}
+                    {modal?.type === 'vehicle' && <VehicleModal db={db} vehicle={modal.data} onClose={() => setModal(null)} api={api} />}
+                    {modal?.type === 'worker' && <WorkerModal worker={modal.data} onClose={() => setModal(null)} api={api} />}
+                    {confirmState && <ConfirmModal state={confirmState} onCancel={() => setConfirmState(null)} />}
+                    {toast && <Toast toast={toast} onClose={() => setToast(null)} />}
+                </>
+            );
+        }
+
+        // =====================================================================
+        // PANEL
+        // =====================================================================
+        function Panel({ db, openOrder }) {
+            const [from, to] = monthRange();
+            const active = db.orders.filter(o => !CLOSED.includes(o.status) && o.status !== 'Rechazado');
+            const pendingAcceptance = db.orders.filter(o => o.status === 'Presupuesto entregado');
+            const closedMonth = db.orders.filter(o => CLOSED.includes(o.status) && o.close_date && o.close_date >= from && o.close_date <= to);
+            const totals = closedMonth.reduce((a, o) => { const c = orderCalc(db, o.id); return { base: a.base + c.billedBase, cost: a.cost + c.cost }; }, { base: 0, cost: 0 });
+            const today = todayISO();
+            const validity = Math.max(12, n(db.settings.validityDays));
+
+            return (
+                <div className="space-y-6 max-w-7xl mx-auto">
+                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                        <Kpi label="Órdenes abiertas" value={active.length} />
+                        <Kpi label="Presupuestos sin respuesta" value={pendingAcceptance.length} />
+                        <Kpi label="Facturable este mes (sin IVA)" value={eur(totals.base)} color="text-emerald-400" />
+                        <Kpi label="Beneficio este mes" value={eur(totals.base - totals.cost)} color={totals.base - totals.cost >= 0 ? 'text-orange-400' : 'text-rose-400'} />
+                    </div>
+                    <p className="text-[11px] text-slate-500 -mt-3">"Este mes" = órdenes terminadas o entregadas entre el {fmtDate(from)} y el {fmtDate(to)}. Importes sin IVA: el IVA no es ingreso del taller.</p>
+
+                    <Card title="En el taller ahora">
+                        {active.length === 0 ? <p className="text-sm text-slate-500">No hay órdenes abiertas.</p> : (
+                            <OrdersTable db={db} orders={active} openOrder={openOrder} />
+                        )}
+                    </Card>
+
+                    {pendingAcceptance.length > 0 && (
+                        <Card title="Presupuestos entregados pendientes de respuesta">
+                            <div className="space-y-2">
+                                {pendingAcceptance.map(o => {
+                                    const { vehicle, client } = orderContext(db, o);
+                                    const until = o.budget_date ? addBusinessDays(o.budget_date, validity) : null;
+                                    const expired = until && until < today;
+                                    return (
+                                        <button key={o.id} onClick={() => openOrder(o.id)} className="w-full text-left flex flex-wrap justify-between gap-2 bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 hover:border-orange-500/50">
+                                            <span className="text-sm"><span className="font-mono font-bold text-orange-400">{vehicle?.license_plate}</span> · {client?.name} · {o.budget_number}</span>
+                                            <span className={`text-xs ${expired ? 'text-rose-400 font-bold' : 'text-slate-400'}`}>{expired ? 'Validez vencida el ' : 'Válido hasta '}{fmtDate(until)}</span>
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        </Card>
+                    )}
+                </div>
+            );
+        }
+
+        function Kpi({ label, value, color = 'text-white' }) {
+            return (
+                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                    <p className="text-[11px] font-semibold text-slate-400 uppercase">{label}</p>
+                    <p className={`text-2xl md:text-3xl font-black mt-2 ${color}`}>{value}</p>
+                </div>
+            );
+        }
+
+        function OrdersTable({ db, orders, openOrder }) {
+            return (
+                <div className="overflow-x-auto">
+                    <table className="w-full text-left text-sm min-w-[640px]">
+                        <thead>
+                            <tr className="border-b border-slate-800 text-slate-400 text-xs uppercase">
+                                <th className="pb-2 px-2">Orden</th><th className="pb-2 px-2">Matrícula</th><th className="pb-2 px-2">Cliente</th>
+                                <th className="pb-2 px-2">Vehículo</th><th className="pb-2 px-2">Entrada</th><th className="pb-2 px-2">Estado</th><th className="pb-2 px-2"></th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800">
+                            {orders.map(o => {
+                                const { vehicle, client } = orderContext(db, o);
+                                return (
+                                    <tr key={o.id}>
+                                        <td className="py-2.5 px-2 font-bold whitespace-nowrap">{o.number}</td>
+                                        <td className="py-2.5 px-2 font-mono font-bold text-orange-400 whitespace-nowrap">{vehicle?.license_plate || '—'}</td>
+                                        <td className="py-2.5 px-2 text-slate-200">{client?.name || '—'}</td>
+                                        <td className="py-2.5 px-2 text-slate-400">{vehicle ? `${vehicle.brand} ${vehicle.model}` : '—'}</td>
+                                        <td className="py-2.5 px-2 text-slate-400 whitespace-nowrap">{fmtDate(o.open_date)}</td>
+                                        <td className="py-2.5 px-2"><StatusBadge status={o.status} /></td>
+                                        <td className="py-2.5 px-2 text-right">
+                                            <button onClick={() => openOrder(o.id)} className="bg-slate-800 hover:bg-orange-500 hover:text-slate-950 text-slate-200 px-3 py-1 rounded-lg text-xs font-bold">Abrir</button>
+                                        </td>
+                                    </tr>
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                </div>
+            );
+        }
+
+        // =====================================================================
+        // LISTA DE ÓRDENES
+        // =====================================================================
+        function OrdersList({ db, openOrder, api }) {
+            const [q, setQ] = useState('');
+            const [status, setStatus] = useState('');
+            const filtered = useMemo(() => {
+                const query = q.trim().toLowerCase();
+                return [...db.orders]
+                    .filter(o => !status || o.status === status)
+                    .filter(o => {
+                        if (!query) return true;
+                        const { vehicle, client } = orderContext(db, o);
+                        return [o.number, vehicle?.license_plate, client?.name, o.budget_number].some(x => (x || '').toLowerCase().includes(query));
+                    })
+                    .sort((a, b) => (b.open_date || '').localeCompare(a.open_date || '') || (b.number || '').localeCompare(a.number || ''));
+            }, [db, q, status]);
+
+            return (
+                <div className="space-y-4 max-w-7xl mx-auto">
+                    <div className="flex flex-wrap gap-3 bg-slate-900 border border-slate-800 p-4 rounded-2xl">
+                        <input type="search" placeholder="Buscar por matrícula, cliente o número…" value={q} onChange={(e) => setQ(e.target.value)} className={`${inputCls} flex-1 min-w-[220px]`} />
+                        <select value={status} onChange={(e) => setStatus(e.target.value)} className={`${inputCls} w-auto`}>
+                            <option value="">Todos los estados</option>
+                            {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+                        </select>
+                    </div>
+                    <Card>
+                        {filtered.length === 0 ? <p className="text-sm text-slate-500">No hay órdenes que coincidan.</p> : <OrdersTable db={db} orders={filtered} openOrder={openOrder} />}
+                    </Card>
+                </div>
+            );
+        }
+
+        // =====================================================================
+        // DETALLE DE ORDEN
+        // =====================================================================
+        function OrderDetail({ db, order, api, onBack }) {
+            const { vehicle, client } = orderContext(db, order);
+            const tasks = db.tasks.filter(t => t.order_id === order.id);
+            const parts = db.parts.filter(p => p.order_id === order.id);
+            const hidden = db.hidden.filter(h => h.order_id === order.id);
+            const calc = orderCalc(db, order.id);
+            const accepted = !!order.budget_accepted_date;
+            const consent = accepted || order.budget_waived;
+            const validity = Math.max(12, n(db.settings.validityDays));
+            const activeWorkers = db.workers.filter(w => w.status !== 'Inactivo');
+
+            const [taskForm, setTaskForm] = useState({ description: '', worker_id: '', hours_budget: '', hours_real: '' });
+            const [partForm, setPartForm] = useState({ description: '', brand: '', supplier: '', quantity: 1, unit_cost: '', unit_price: '' });
+            const [hiddenForm, setHiddenForm] = useState({ description: '', amount: '', communicated_date: todayISO() });
+            const [acceptDate, setAcceptDate] = useState(todayISO());
+
+            const setO = (changes) => api.upd('orders', order.id, changes);
+
+            const addTask = (e) => {
+                e.preventDefault();
+                if (!taskForm.description.trim()) return;
+                api.add('tasks', { order_id: order.id, ...taskForm, description: taskForm.description.trim() });
+                setTaskForm({ description: '', worker_id: taskForm.worker_id, hours_budget: '', hours_real: '' });
+            };
+            const addPart = (e) => {
+                e.preventDefault();
+                if (!partForm.description.trim()) return;
+                api.add('parts', { order_id: order.id, ...partForm, description: partForm.description.trim() });
+                setPartForm({ description: '', brand: '', supplier: '', quantity: 1, unit_cost: '', unit_price: '' });
+            };
+            const addHidden = (e) => {
+                e.preventDefault();
+                if (!hiddenForm.description.trim()) return;
+                api.add('hidden', { order_id: order.id, ...hiddenForm, description: hiddenForm.description.trim(), accepted: null });
+                setHiddenForm({ description: '', amount: '', communicated_date: todayISO() });
+            };
+
+            const budgetLocked = accepted; // tras la aceptación, el presupuesto queda congelado (las horas reales se siguen editando)
+
+            return (
+                <div className="space-y-5 max-w-6xl mx-auto">
+                    {/* Cabecera */}
+                    <div className="flex flex-wrap justify-between items-center gap-3 bg-slate-900 border border-slate-800 p-4 rounded-2xl">
+                        <div className="flex items-center gap-3">
+                            <button onClick={onBack} className={btnSecondary}>← Volver</button>
+                            <div>
+                                <p className="font-black text-white">{order.number}</p>
+                                <p className="text-xs text-slate-400">Entrada {fmtDate(order.open_date)}</p>
+                            </div>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <select value={order.status} onChange={(e) => api.changeStatus(order, e.target.value)} className={`${inputCls} w-auto font-bold text-orange-400`} aria-label="Estado de la orden">
+                                {STATUSES.map(s => <option key={s} value={s} disabled={NEEDS_CONSENT.includes(s) && !consent}>{s}{NEEDS_CONSENT.includes(s) && !consent ? ' (requiere aceptación)' : ''}</option>)}
+                            </select>
+                            <button className={btnSecondary} onClick={() => api.setDoc({ type: 'resguardo', orderId: order.id })}>🧾 Resguardo</button>
+                            <button className={btnSecondary} disabled={!order.budget_number} title={order.budget_number ? '' : 'Primero genera el presupuesto'} onClick={() => api.setDoc({ type: 'presupuesto', orderId: order.id })}>📄 Presupuesto</button>
+                            <button className={btnSecondary} onClick={() => api.setDoc({ type: 'resumen', orderId: order.id })}>🧮 Datos para facturar</button>
+                        </div>
+                    </div>
+
+                    <div className="grid md:grid-cols-2 gap-5">
+                        <Card title="Cliente">
+                            {client ? (
+                                <div className="text-sm space-y-1">
+                                    <p className="font-bold text-white">{client.name}</p>
+                                    <p className="text-slate-400">NIF: {client.nif || '—'} · Tel: {client.phone || '—'}</p>
+                                    <p className={client.address ? 'text-slate-400' : 'text-rose-400'}>{client.address || 'Falta el domicilio (obligatorio en presupuesto y resguardo)'}</p>
+                                    <button className="text-xs text-orange-400 underline mt-1" onClick={() => api.setModal({ type: 'client', data: client })}>Editar cliente</button>
+                                </div>
+                            ) : <p className="text-sm text-rose-400">Cliente no encontrado.</p>}
+                        </Card>
+                        <Card title="Vehículo">
+                            {vehicle ? (
+                                <div className="text-sm space-y-1">
+                                    <p className="font-bold text-white font-mono">{vehicle.license_plate}</p>
+                                    <p className="text-slate-400">{vehicle.brand} {vehicle.model} {vehicle.year ? `(${vehicle.year})` : ''}</p>
+                                    <button className="text-xs text-orange-400 underline mt-1" onClick={() => api.setModal({ type: 'vehicle', data: vehicle })}>Editar vehículo</button>
+                                </div>
+                            ) : <p className="text-sm text-rose-400">Vehículo no encontrado.</p>}
+                        </Card>
+                    </div>
+
+                    <Card title="Datos de entrada">
+                        <div className="grid md:grid-cols-4 gap-4">
+                            <Field label="Kilómetros a la entrada">
+                                <input type="number" min="0" value={order.km ?? ''} onChange={(e) => setO({ km: e.target.value })} className={inputCls} />
+                            </Field>
+                            <Field label="Depósito para">
+                                <select value={order.deposit_for} onChange={(e) => setO({ deposit_for: e.target.value })} className={inputCls}>
+                                    <option value="presupuesto">Elaborar presupuesto</option>
+                                    <option value="reparación">Reparación</option>
+                                </select>
+                            </Field>
+                            <Field label="Entrega prevista" hint="Del presupuesto o del vehículo (sale en el resguardo)">
+                                <input type="date" value={order.expected_date || ''} onChange={(e) => setO({ expected_date: e.target.value })} className={inputCls} />
+                            </Field>
+                            <Field label="Plazo de reparación" hint="Días hábiles desde la aceptación (sale en el presupuesto)">
+                                <input type="number" min="0" value={order.expected_days ?? ''} onChange={(e) => setO({ expected_days: e.target.value })} className={inputCls} disabled={budgetLocked} />
+                            </Field>
+                            <Field label="Trabajo solicitado / avería descrita por el cliente" className="md:col-span-3">
+                                <textarea rows="2" value={order.customer_request || ''} onChange={(e) => setO({ customer_request: e.target.value })} className={inputCls} />
+                            </Field>
+                            <Field label="Piezas sustituidas" hint="Art. 9.5: se entregan salvo que el cliente diga lo contrario">
+                                <select value={order.return_parts ? 'si' : 'no'} onChange={(e) => setO({ return_parts: e.target.value === 'si' })} className={inputCls}>
+                                    <option value="si">Entregar al cliente</option>
+                                    <option value="no">El cliente renuncia</option>
+                                </select>
+                            </Field>
+                            <Field label="Notas internas (no salen en documentos)" className="md:col-span-4">
+                                <input type="text" value={order.notes || ''} onChange={(e) => setO({ notes: e.target.value })} className={inputCls} />
+                            </Field>
+                        </div>
+                    </Card>
+
+                    {/* Mano de obra */}
+                    <Card title="🛠️ Mano de obra" right={<span className="text-xs text-slate-400">Tarifa: {eur(calc.rate)}/h sin IVA</span>}>
+                        {budgetLocked && <p className="text-xs text-violet-300 mb-3">Presupuesto aceptado: las horas presupuestadas quedan bloqueadas. Las horas reales se siguen anotando.</p>}
+                        <div className="overflow-x-auto">
+                            <div className="min-w-[640px] space-y-2">
+                                <div className="grid grid-cols-12 gap-2 text-[11px] uppercase text-slate-500 px-2">
+                                    <span className="col-span-5">Descripción</span><span className="col-span-3">Mecánico</span><span className="col-span-2">H. presup.</span><span className="col-span-1">H. reales</span><span className="col-span-1"></span>
+                                </div>
+                                {tasks.map(t => (
+                                    <div key={t.id} className="grid grid-cols-12 gap-2 items-center bg-slate-950 p-2 rounded-xl border border-slate-800">
+                                        <input aria-label="Descripción" type="text" value={t.description} onChange={(e) => api.upd('tasks', t.id, { description: e.target.value })} className={`col-span-5 ${cellCls}`} disabled={budgetLocked} />
+                                        <select aria-label="Mecánico" value={t.worker_id || ''} onChange={(e) => api.upd('tasks', t.id, { worker_id: e.target.value })} className={`col-span-3 ${cellCls}`}>
+                                            <option value="">— Sin asignar —</option>
+                                            {db.workers.map(w => <option key={w.id} value={w.id} disabled={w.status === 'Inactivo' && w.id !== t.worker_id}>{w.name}{w.status === 'Inactivo' ? ' (inactivo)' : ''}</option>)}
+                                        </select>
+                                        <input aria-label="Horas presupuestadas" type="number" step="0.25" min="0" value={t.hours_budget} onChange={(e) => api.upd('tasks', t.id, { hours_budget: e.target.value })} className={`col-span-2 ${cellCls} text-center`} disabled={budgetLocked} />
+                                        <input aria-label="Horas reales" type="number" step="0.25" min="0" value={t.hours_real} onChange={(e) => api.upd('tasks', t.id, { hours_real: e.target.value })} className={`col-span-1 ${cellCls} text-center font-bold text-orange-400`} />
+                                        <button type="button" onClick={() => api.del('tasks', t.id)} disabled={budgetLocked} className="col-span-1 text-slate-500 hover:text-rose-400 font-bold text-xs disabled:opacity-30" title="Eliminar tarea">✕</button>
+                                    </div>
+                                ))}
+                                <form onSubmit={addTask} className="grid grid-cols-12 gap-2 pt-2 border-t border-slate-800">
+                                        <input type="text" placeholder="Nueva tarea…" value={taskForm.description} onChange={(e) => setTaskForm({ ...taskForm, description: e.target.value })} className={`col-span-5 ${cellCls}`} />
+                                        <select value={taskForm.worker_id} onChange={(e) => setTaskForm({ ...taskForm, worker_id: e.target.value })} className={`col-span-3 ${cellCls}`}>
+                                            <option value="">Mecánico…</option>
+                                            {activeWorkers.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
+                                        </select>
+                                        <input type="number" step="0.25" min="0" placeholder={budgetLocked ? '0 (fuera de presup.)' : 'Horas'} value={taskForm.hours_budget} onChange={(e) => setTaskForm({ ...taskForm, hours_budget: e.target.value })} className={`col-span-2 ${cellCls}`} disabled={budgetLocked} />
+                                        <input type="number" step="0.25" min="0" placeholder="Reales" value={taskForm.hours_real} onChange={(e) => setTaskForm({ ...taskForm, hours_real: e.target.value })} className={`col-span-1 ${cellCls}`} />
+                                        <button type="submit" className="col-span-1 bg-orange-500 text-slate-950 rounded-md text-sm font-bold" aria-label="Añadir tarea">+</button>
+                                    </form>
+                            </div>
+                        </div>
+                        {budgetLocked && <p className="text-[11px] text-slate-500 mt-2">Las tareas añadidas tras la aceptación deberían corresponder a averías ocultas comunicadas y aceptadas (ver abajo).</p>}
+                    </Card>
+
+                    {/* Recambios */}
+                    <Card title="📦 Recambios y materiales" right={<span className="text-xs text-slate-400">Galicia (Decreto 70/2011, art. 8.4): conservar origen, marca y precio 4 años</span>}>
+                        <div className="overflow-x-auto">
+                            <div className="min-w-[760px] space-y-2">
+                                <div className="grid grid-cols-12 gap-2 text-[11px] uppercase text-slate-500 px-2">
+                                    <span className="col-span-3">Descripción</span><span className="col-span-2">Marca</span><span className="col-span-2">Proveedor</span>
+                                    <span className="col-span-1">Cant.</span><span className="col-span-1">Coste ud.</span><span className="col-span-2">PVP ud. (sin IVA)</span><span className="col-span-1"></span>
+                                </div>
+                                {parts.map(p => (
+                                    <div key={p.id} className="grid grid-cols-12 gap-2 items-center bg-slate-950 p-2 rounded-xl border border-slate-800">
+                                        <input aria-label="Descripción" type="text" value={p.description} onChange={(e) => api.upd('parts', p.id, { description: e.target.value })} className={`col-span-3 ${cellCls}`} />
+                                        <input aria-label="Marca" type="text" value={p.brand || ''} onChange={(e) => api.upd('parts', p.id, { brand: e.target.value })} className={`col-span-2 ${cellCls}`} />
+                                        <input aria-label="Proveedor" type="text" value={p.supplier || ''} onChange={(e) => api.upd('parts', p.id, { supplier: e.target.value })} className={`col-span-2 ${cellCls}`} />
+                                        <input aria-label="Cantidad" type="number" step="0.01" min="0" value={p.quantity} onChange={(e) => api.upd('parts', p.id, { quantity: e.target.value })} className={`col-span-1 ${cellCls} text-center`} />
+                                        <input aria-label="Coste unitario" type="number" step="0.01" min="0" value={p.unit_cost} onChange={(e) => api.upd('parts', p.id, { unit_cost: e.target.value })} className={`col-span-1 ${cellCls} text-right`} />
+                                        <input aria-label="Precio de venta unitario" type="number" step="0.01" min="0" value={p.unit_price} onChange={(e) => api.upd('parts', p.id, { unit_price: e.target.value })} className={`col-span-2 ${cellCls} text-right font-bold text-orange-400`} />
+                                        <button type="button" onClick={() => api.del('parts', p.id)} className="col-span-1 text-slate-500 hover:text-rose-400 font-bold text-xs" title="Eliminar recambio">✕</button>
+                                    </div>
+                                ))}
+                                <form onSubmit={addPart} className="grid grid-cols-12 gap-2 pt-2 border-t border-slate-800">
+                                    <input type="text" placeholder="Pieza…" value={partForm.description} onChange={(e) => setPartForm({ ...partForm, description: e.target.value })} className={`col-span-3 ${cellCls}`} />
+                                    <input type="text" placeholder="Marca" value={partForm.brand} onChange={(e) => setPartForm({ ...partForm, brand: e.target.value })} className={`col-span-2 ${cellCls}`} />
+                                    <input type="text" placeholder="Proveedor" value={partForm.supplier} onChange={(e) => setPartForm({ ...partForm, supplier: e.target.value })} className={`col-span-2 ${cellCls}`} />
+                                    <input type="number" step="0.01" min="0" placeholder="Cant." value={partForm.quantity} onChange={(e) => setPartForm({ ...partForm, quantity: e.target.value })} className={`col-span-1 ${cellCls}`} />
+                                    <input type="number" step="0.01" min="0" placeholder="Coste" value={partForm.unit_cost} onChange={(e) => setPartForm({ ...partForm, unit_cost: e.target.value })} className={`col-span-1 ${cellCls}`} />
+                                    <input type="number" step="0.01" min="0" placeholder="PVP" value={partForm.unit_price} onChange={(e) => setPartForm({ ...partForm, unit_price: e.target.value })} className={`col-span-2 ${cellCls}`} />
+                                    <button type="submit" className="col-span-1 bg-orange-500 text-slate-950 rounded-md text-sm font-bold" aria-label="Añadir recambio">+</button>
+                                </form>
+                            </div>
+                        </div>
+                        {accepted && <p className="text-[11px] text-slate-500 mt-2">Cambiar recambios no modifica el presupuesto aceptado (está congelado), pero sí los datos para facturar.</p>}
+                    </Card>
+
+                    {/* Presupuesto */}
+                    <Card title="📄 Presupuesto">
+                        {!order.budget_number && !order.budget_waived && (
+                            <div className="flex flex-wrap items-center gap-3">
+                                <p className="text-sm text-slate-400 flex-1">Añade la mano de obra presupuestada y los recambios, y genera el presupuesto. No se puede empezar a reparar sin su aceptación firmada o una renuncia escrita del cliente.</p>
+                                <button className={btnPrimary} onClick={() => api.generateBudget(order)} disabled={tasks.length + parts.length === 0}>Generar presupuesto</button>
+                            </div>
+                        )}
+                        {order.budget_number && (
+                            <div className="text-sm space-y-1 mb-3">
+                                <p><span className="text-slate-400">Número:</span> <strong>{order.budget_number}</strong> · <span className="text-slate-400">emitido</span> {fmtDate(order.budget_date)} · <span className="text-slate-400">válido hasta</span> {fmtDate(addBusinessDays(order.budget_date, validity))}</p>
+                                <p><span className="text-slate-400">Importe {accepted ? 'aceptado' : 'actual'}:</span> <strong>{eur(accepted ? order.budget_snapshot.base : makeSnapshot(db, order.id, order.budget_date).base)}</strong> sin IVA</p>
+                                {accepted && <p className="text-violet-300">✔ Aceptado y firmado el {fmtDate(order.budget_accepted_date)}. El presupuesto queda congelado tal como estaba en esa fecha.</p>}
+                            </div>
+                        )}
+                        {order.budget_waived && <p className="text-sm text-violet-300 mb-3">✔ El cliente renunció por escrito al presupuesto el {fmtDate(order.budget_waived_date)} (debe firmar la renuncia en el resguardo).</p>}
+
+                        {!consent && (
+                            <div className="flex flex-wrap items-end gap-3 border-t border-slate-800 pt-3">
+                                {order.budget_number && (
+                                    <>
+                                        <Field label="Fecha de aceptación firmada">
+                                            <input type="date" value={acceptDate} onChange={(e) => setAcceptDate(e.target.value)} className={inputCls} />
+                                        </Field>
+                                        <button className={btnPrimary} onClick={() => api.ask({
+                                            title: 'Registrar aceptación',
+                                            message: 'Se congelará el presupuesto tal como está ahora. Comprueba que coincide con el papel firmado por el cliente.',
+                                            confirmLabel: 'Registrar aceptación', onConfirm: () => api.acceptBudget(order, acceptDate),
+                                        })}>Registrar aceptación firmada</button>
+                                        <button className={btnSecondary} onClick={() => api.changeStatus(order, 'Rechazado')}>Rechazado por el cliente</button>
+                                    </>
+                                )}
+                                <button className={btnSecondary} onClick={() => api.ask({
+                                    title: 'Renuncia al presupuesto',
+                                    message: 'El art. 14.5 del RD 1457/1986 exige que la renuncia sea fehaciente: el cliente debe firmarla. Se añadirá al resguardo de depósito un apartado de renuncia para su firma.',
+                                    confirmLabel: 'Registrar renuncia', onConfirm: () => api.upd('orders', order.id, { budget_waived: true, budget_waived_date: todayISO() }),
+                                })}>El cliente renuncia al presupuesto</button>
+                            </div>
+                        )}
+                        {consent && (
+                            <button className="text-xs text-slate-500 underline mt-2" onClick={() => api.ask({
+                                title: 'Anular aceptación o renuncia', danger: true, confirmLabel: 'Anular',
+                                message: 'Úsalo solo para corregir un error. Se descongelará el presupuesto y la orden volverá a estar pendiente de aceptación.',
+                                onConfirm: () => api.undoAcceptance(order),
+                            })}>Anular aceptación / renuncia (corregir error)</button>
+                        )}
+                    </Card>
+
+                    {/* Averías ocultas */}
+                    <Card title="⚠️ Averías ocultas durante la reparación">
+                        <p className="text-xs text-slate-400 mb-3">Art. 14.6: hay que comunicarlas al cliente en un máximo de 48 horas, con su importe, y solo se reparan con su conformidad expresa. Si no las acepta, debe constar en la factura (art. 16.6).</p>
+                        <div className="space-y-2">
+                            {hidden.map(h => (
+                                <div key={h.id} className="grid grid-cols-12 gap-2 items-center bg-slate-950 p-2 rounded-xl border border-slate-800">
+                                    <input aria-label="Descripción" type="text" value={h.description} onChange={(e) => api.upd('hidden', h.id, { description: e.target.value })} className={`col-span-12 md:col-span-5 ${cellCls}`} />
+                                    <input aria-label="Importe sin IVA" type="number" step="0.01" min="0" value={h.amount} onChange={(e) => api.upd('hidden', h.id, { amount: e.target.value })} className={`col-span-4 md:col-span-2 ${cellCls} text-right`} />
+                                    <input aria-label="Fecha de comunicación" type="date" value={h.communicated_date || ''} onChange={(e) => api.upd('hidden', h.id, { communicated_date: e.target.value })} className={`col-span-4 md:col-span-2 ${cellCls}`} />
+                                    <select aria-label="Respuesta del cliente" value={h.accepted === true ? 'si' : h.accepted === false ? 'no' : ''} onChange={(e) => api.upd('hidden', h.id, { accepted: e.target.value === 'si' ? true : e.target.value === 'no' ? false : null })} className={`col-span-3 md:col-span-2 ${cellCls}`}>
+                                        <option value="">Sin respuesta</option><option value="si">Aceptada</option><option value="no">No aceptada</option>
+                                    </select>
+                                    <button type="button" onClick={() => api.del('hidden', h.id)} className="col-span-1 text-slate-500 hover:text-rose-400 font-bold text-xs" title="Eliminar">✕</button>
+                                </div>
+                            ))}
+                            <form onSubmit={addHidden} className="grid grid-cols-12 gap-2 pt-2 border-t border-slate-800">
+                                <input type="text" placeholder="Avería detectada…" value={hiddenForm.description} onChange={(e) => setHiddenForm({ ...hiddenForm, description: e.target.value })} className={`col-span-12 md:col-span-5 ${cellCls}`} />
+                                <input type="number" step="0.01" min="0" placeholder="Importe sin IVA" value={hiddenForm.amount} onChange={(e) => setHiddenForm({ ...hiddenForm, amount: e.target.value })} className={`col-span-5 md:col-span-3 ${cellCls}`} />
+                                <input type="date" value={hiddenForm.communicated_date} onChange={(e) => setHiddenForm({ ...hiddenForm, communicated_date: e.target.value })} className={`col-span-5 md:col-span-3 ${cellCls}`} />
+                                <button type="submit" className="col-span-2 md:col-span-1 bg-orange-500 text-slate-950 rounded-md text-sm font-bold" aria-label="Añadir avería oculta">+</button>
+                            </form>
+                        </div>
+                    </Card>
+
+                    {/* Rentabilidad */}
+                    <Card title="📈 Rentabilidad de la orden (sin IVA)">
+                        <div className="grid md:grid-cols-2 gap-6">
+                            <div className="space-y-1.5 text-sm">
+                                <Row label="Mano de obra (horas reales × tarifa)" value={eur(calc.laborReal)} />
+                                <Row label="Recambios (PVP)" value={eur(calc.partsSale)} />
+                                <Row label="Importe calculado" value={eur(calc.computedBase)} strong />
+                                {calc.hasOverride && <Row label="Importe final acordado" value={eur(calc.billedBase)} strong />}
+                                <div className="border-t border-slate-800 my-2" />
+                                <Row label="Coste mano de obra (coste/hora del mecánico)" value={eur(calc.laborCost)} />
+                                <Row label="Coste recambios" value={eur(calc.partsCost)} />
+                                <Row label="Coste total" value={eur(calc.cost)} strong />
+                                <Row label="Beneficio" value={eur(calc.profit)} strong color={calc.profit >= 0 ? 'text-orange-400' : 'text-rose-400'} />
+                                {calc.margin !== null && <Row label="Margen" value={`${num(calc.margin)} %`} />}
+                            </div>
+                            <div className="space-y-3">
+                                <Field label="Importe final acordado (sin IVA) — opcional" hint="Solo si se cobra distinto de lo calculado (descuento, redondeo). Déjalo vacío para usar el cálculo.">
+                                    <input type="number" step="0.01" min="0" value={order.final_amount ?? ''} onChange={(e) => setO({ final_amount: e.target.value })} className={inputCls} placeholder={String(calc.computedBase)} />
+                                </Field>
+                                {calc.limit !== null && (
+                                    <div className={`text-xs rounded-xl p-3 border ${calc.overLimit ? 'bg-rose-500/10 border-rose-500/40 text-rose-200' : 'bg-slate-950 border-slate-800 text-slate-400'}`}>
+                                        Límite según presupuesto aceptado ({eur(calc.budgetBase)}) + averías ocultas aceptadas ({eur(calc.acceptedHidden)}): <strong>{eur(calc.limit)}</strong>.
+                                        {calc.overLimit && <> El importe supera lo aceptado: no se puede cobrar el exceso (RD 1457/1986, art. 16.7).</>}
+                                    </div>
+                                )}
+                                <p className="text-[11px] text-slate-500">La factura se emite en el programa de facturación del taller. Usa "Datos para facturar" para pasar los importes.</p>
+                            </div>
+                        </div>
+                    </Card>
+
+                    <div className="flex justify-end">
+                        <button className="text-xs text-slate-500 hover:text-rose-400 underline" onClick={() => api.ask({
+                            title: 'Eliminar orden', danger: true, confirmLabel: 'Eliminar definitivamente',
+                            message: `Se eliminará la orden ${order.number} con sus tareas, recambios y averías. No se puede deshacer.${order.budget_number ? '\n\nAtención: esta orden ya tiene presupuesto emitido. Conservar el registro suele ser preferible.' : ''}`,
+                            onConfirm: () => api.deleteOrder(order),
+                        })}>Eliminar orden</button>
+                    </div>
+                </div>
+            );
+        }
+
+        function Row({ label, value, strong, color }) {
+            return (
+                <div className="flex justify-between gap-4">
+                    <span className="text-slate-400">{label}</span>
+                    <span className={`${strong ? 'font-bold' : ''} ${color || 'text-white'} whitespace-nowrap`}>{value}</span>
+                </div>
+            );
+        }
+
+        // =====================================================================
+        // DOCUMENTOS IMPRIMIBLES: RESGUARDO, PRESUPUESTO, DATOS PARA FACTURAR
+        // =====================================================================
+        function DocHeader({ s, title, number, date, extra }) {
+            return (
+                <div className="flex justify-between items-start gap-6 border-b border-slate-300 pb-5 mb-5">
+                    <div className="flex items-start gap-4">
+                        <Logo settings={s} className="w-28 h-20 flex-shrink-0" />
+                        <div className="space-y-0.5">
+                            <p className="text-lg font-black text-slate-900">{s.name}</p>
+                            <p>NIF: {s.nif}</p>
+                            <p>{s.address}</p>
+                            {(s.phone || s.email) && <p>{[s.phone && `Tel. ${s.phone}`, s.email].filter(Boolean).join(' · ')}</p>}
+                            {s.regNumber && <p>Nº de identificación del taller: {s.regNumber}</p>}
+                        </div>
+                    </div>
+                    <div className="text-right space-y-0.5">
+                        <p className="text-base font-black uppercase tracking-wide text-orange-600">{title}</p>
+                        {number && <p className="font-bold">{number}</p>}
+                        {date && <p>Fecha: {fmtDate(date)}</p>}
+                        {extra}
+                    </div>
+                </div>
+            );
+        }
+
+        function PartiesBlock({ client, vehicle, order }) {
+            return (
+                <div className="grid grid-cols-2 gap-4 mb-5 avoid-break">
+                    <div className="border border-slate-300 rounded-lg p-3">
+                        <p className="text-[10px] font-bold uppercase text-slate-500 mb-1">Cliente</p>
+                        <p className="font-bold">{client?.name || '—'}</p>
+                        {client?.nif && <p>NIF/DNI: {client.nif}</p>}
+                        <p>Domicilio: {client?.address || '—'}</p>
+                        {client?.phone && <p>Tel.: {client.phone}</p>}
+                    </div>
+                    <div className="border border-slate-300 rounded-lg p-3">
+                        <p className="text-[10px] font-bold uppercase text-slate-500 mb-1">Vehículo</p>
+                        <p className="font-bold">{vehicle ? `${vehicle.brand} ${vehicle.model}` : '—'}</p>
+                        <p>Matrícula: <span className="font-mono font-bold">{vehicle?.license_plate || '—'}</span></p>
+                        <p>Kilómetros: {order.km !== '' && order.km != null ? `${num(order.km)} km` : '—'}</p>
+                        <p>Fecha de entrada: {fmtDate(order.open_date)} · Orden {order.number}</p>
+                    </div>
+                </div>
+            );
+        }
+
+        function SignatureBoxes({ left, right }) {
+            return (
+                <div className="grid grid-cols-2 gap-6 mt-6 avoid-break">
+                    {[left, right].map((label, i) => (
+                        <div key={i} className="border border-slate-400 rounded-lg p-3 h-32 flex flex-col justify-between">
+                            <p className="text-[11px] font-bold">{label}</p>
+                            <p className="text-[11px] text-slate-500">Fecha: ____ / ____ / ________&nbsp;&nbsp;&nbsp;Firma:</p>
+                        </div>
+                    ))}
+                </div>
+            );
+        }
+
+        function DocumentView({ db, doc, onClose, notify }) {
+            const order = db.orders.find(o => o.id === doc.orderId);
+            if (!order) return null;
+            const s = db.settings;
+            const { vehicle, client } = orderContext(db, order);
+            const calc = orderCalc(db, order.id);
+            const validity = Math.max(12, n(s.validityDays));
+
+            // Avisos de datos que faltan para cumplir el RD 1457/1986
+            const missing = [];
+            if (!s.nif || !s.address) missing.push('NIF o domicilio del taller (Ajustes)');
+            if (!client?.name || !client?.address) missing.push('nombre o domicilio del cliente');
+            if (!vehicle?.brand || !vehicle?.model || !vehicle?.license_plate) missing.push('marca, modelo o matrícula');
+            if (order.km === '' || order.km == null) missing.push('kilómetros');
+
+            let title, body, copyText = null;
+
+            if (doc.type === 'presupuesto') {
+                const snap = order.budget_snapshot || makeSnapshot(db, order.id, order.budget_date || todayISO());
+                const issue = order.budget_date || todayISO();
+                const until = addBusinessDays(issue, validity);
+                if (order.expected_days === '' || order.expected_days == null) missing.push('plazo de reparación');
+                if (snap.labor.length + snap.parts.length === 0) missing.push('líneas de mano de obra o recambios');
+                title = 'Presupuesto';
+                body = (
+                    <>
+                        <DocHeader s={s} title="Presupuesto" number={order.budget_number} date={issue}
+                            extra={<p>Válido hasta: <strong>{fmtDate(until)}</strong></p>} />
+                        <PartiesBlock client={client} vehicle={vehicle} order={order} />
+                        <div className="mb-4">
+                            <p className="text-[10px] font-bold uppercase text-slate-500">Trabajo solicitado / avería indicada</p>
+                            <p>{order.customer_request || '—'}</p>
+                        </div>
+                        <BudgetTable snap={snap} />
+                        <div className="grid grid-cols-2 gap-4 mt-5 avoid-break">
+                            <div className="border border-slate-300 rounded-lg p-3 space-y-1">
+                                <p><strong>Plazo previsto de entrega del vehículo reparado:</strong> {order.expected_days !== '' && order.expected_days != null ? `${order.expected_days} días hábiles desde la aceptación de este presupuesto` : '—'}.</p>
+                                <p><strong>Validez del presupuesto:</strong> {validity} días hábiles, hasta el {fmtDate(until)}.</p>
+                                <p><strong>Precio de la hora de mano de obra:</strong> {eur(snap.rate)} (IVA no incluido).</p>
+                            </div>
+                            <div className="border border-slate-300 rounded-lg p-3 space-y-2">
+                                <p className="font-bold">Piezas sustituidas (marque una opción):</p>
+                                <p>☐ Deseo que se me entreguen las piezas sustituidas.</p>
+                                <p>☐ No deseo que se me entreguen.</p>
+                            </div>
+                        </div>
+                        <div className="doc-legal mt-5 space-y-1 avoid-break">
+                            <p className="font-bold">Condiciones (Real Decreto 1457/1986)</p>
+                            <p>• Las reparaciones quedan garantizadas durante 3 meses o 2.000 km (vehículos industriales: 15 días o 2.000 km), lo que antes ocurra, desde la entrega del vehículo, en los términos del art. 16. Si alguna pieza tiene un plazo de garantía superior, rige ese plazo para dicha pieza.</p>
+                            <p>• Las averías o defectos ocultos que aparezcan durante la reparación se comunicarán al cliente en un plazo máximo de 48 horas, con su importe, y solo se repararán con su conformidad expresa (art. 14.6).</p>
+                            <p>• Si el presupuesto no se acepta, el vehículo se devolverá en análogas condiciones a las de su entrega (art. 14.4).</p>
+                            <p>• Solo se devengarán gastos de estancia si, comunicado el presupuesto o finalizada la reparación, el cliente no se pronuncia o no retira el vehículo en 3 días hábiles (art. 15.2).</p>
+                            <p>• El cliente puede desistir del encargo en cualquier momento, abonando los trabajos efectuados hasta la retirada del vehículo (art. 14.9).</p>
+                            <p>• Firmado por el taller y el cliente, este presupuesto hace las veces de resguardo de depósito (art. 14.7). Hay hojas de reclamaciones a disposición del cliente.</p>
+                        </div>
+                        <SignatureBoxes left={`Por el taller (${s.name})`} right="Aceptación del cliente" />
+                        {order.budget_accepted_date && <p className="text-[11px] text-slate-500 mt-3 no-print">Registrado como aceptado el {fmtDate(order.budget_accepted_date)}. Se muestra la versión congelada en esa fecha.</p>}
+                    </>
+                );
+            } else if (doc.type === 'resguardo') {
+                if (!order.expected_date) missing.push('fecha prevista de entrega');
+                const forBudget = order.deposit_for === 'presupuesto';
+                title = 'Resguardo de depósito';
+                body = (
+                    <>
+                        <DocHeader s={s} title="Resguardo de depósito" number={order.number} date={order.open_date} />
+                        <PartiesBlock client={client} vehicle={vehicle} order={order} />
+                        <div className="border border-slate-300 rounded-lg p-3 mb-4 space-y-1">
+                            <p><strong>El vehículo se deposita para:</strong> {forBudget ? 'la elaboración de un presupuesto' : 'su reparación'}.</p>
+                            <p><strong>Descripción:</strong> {order.customer_request || '—'}</p>
+                            {!forBudget && order.budget_snapshot && <p><strong>Importe del presupuesto aceptado {order.budget_number}:</strong> {eur(order.budget_snapshot.base)} + IVA ({eur(order.budget_snapshot.total)} IVA incluido).</p>}
+                            {!forBudget && !order.budget_snapshot && calc.computedBase > 0 && <p><strong>Importe estimado conocido:</strong> {eur(calc.computedBase)} + IVA.</p>}
+                            <p><strong>Fecha prevista de entrega {forBudget ? 'del presupuesto' : 'del vehículo reparado'}:</strong> {fmtDate(order.expected_date)}</p>
+                        </div>
+                        {order.budget_waived && (
+                            <div className="border-2 border-slate-500 rounded-lg p-3 mb-4 avoid-break">
+                                <p className="font-bold">Renuncia al presupuesto</p>
+                                <p className="doc-legal">El cliente abajo firmante renuncia expresamente a la elaboración de presupuesto previo y autoriza la reparación descrita (RD 1457/1986, art. 14.5).</p>
+                            </div>
+                        )}
+                        <div className="doc-legal space-y-1 avoid-break">
+                            <p>• Es imprescindible presentar este resguardo para recoger el presupuesto o retirar el vehículo. En caso de pérdida, el cliente deberá identificarse a plena satisfacción del taller (art. 14.7.2 y 14.7.3).</p>
+                            <p>• Solo se devengarán gastos de estancia si el cliente no se pronuncia sobre el presupuesto o no retira el vehículo en 3 días hábiles desde que se le comunique (art. 15.2).</p>
+                            <p>• Hay hojas de reclamaciones a disposición del cliente.</p>
+                        </div>
+                        <SignatureBoxes left={`Por el taller (${s.name})`} right={order.budget_waived ? 'El cliente (conformidad y renuncia al presupuesto)' : 'El cliente (recibí copia)'} />
+                    </>
+                );
+            } else {
+                const tasks = db.tasks.filter(t => t.order_id === order.id);
+                const parts = db.parts.filter(p => p.order_id === order.id);
+                const rejected = db.hidden.filter(h => h.order_id === order.id && h.accepted === false);
+                const warrantyUntil = order.delivery_date ? addMonths(order.delivery_date, 3) : null;
+                title = 'Datos para facturar';
+                const lines = [
+                    ...tasks.map(t => ({ desc: `Mano de obra: ${t.description}`, qty: `${num(t.hours_real)} h`, price: calc.rate, amount: round2(n(t.hours_real) * calc.rate) })),
+                    ...parts.map(p => ({ desc: `${p.description}${p.brand ? ` (${p.brand})` : ''}`, qty: num(p.quantity), price: n(p.unit_price), amount: round2(n(p.quantity) * n(p.unit_price)) })),
+                ];
+                copyText = [
+                    `DATOS PARA FACTURAR – ${order.number}`,
+                    `Cliente: ${client?.name || ''} · NIF ${client?.nif || ''} · ${client?.address || ''}`,
+                    `Vehículo: ${vehicle?.brand || ''} ${vehicle?.model || ''} · ${vehicle?.license_plate || ''} · ${order.km || ''} km`,
+                    '',
+                    ...lines.map(l => `${l.desc} | ${l.qty} | ${num(l.price)} € | ${num(l.amount)} €`),
+                    '',
+                    `Base imponible: ${num(calc.billedBase)} €${calc.hasOverride ? ' (importe final acordado)' : ''}`,
+                    `IVA ${num(calc.ivaRate)} %: ${num(calc.iva)} €`,
+                    `Total: ${num(calc.total)} €`,
+                    ...rejected.map(h => `No aceptada por el cliente: ${h.description} (comunicada el ${fmtDate(h.communicated_date)})`),
+                ].join('\n');
+                body = (
+                    <>
+                        <div className="bg-amber-100 border-2 border-amber-500 text-amber-900 rounded-lg p-3 mb-5 font-bold text-center">
+                            DOCUMENTO INTERNO · NO ES UNA FACTURA · No entregar al cliente
+                        </div>
+                        <DocHeader s={s} title="Datos para facturar" number={order.number} date={todayISO()} />
+                        <PartiesBlock client={client} vehicle={vehicle} order={order} />
+                        <table className="w-full text-left border-collapse mb-4">
+                            <thead><tr className="border-b-2 border-slate-400"><th className="py-2 pr-2">Concepto</th><th className="py-2 px-2 text-center">Cant.</th><th className="py-2 px-2 text-right">Precio ud.</th><th className="py-2 pl-2 text-right">Importe</th></tr></thead>
+                            <tbody className="divide-y divide-slate-200">
+                                {lines.map((l, i) => <tr key={i}><td className="py-1.5 pr-2">{l.desc}</td><td className="py-1.5 px-2 text-center">{l.qty}</td><td className="py-1.5 px-2 text-right">{eur(l.price)}</td><td className="py-1.5 pl-2 text-right">{eur(l.amount)}</td></tr>)}
+                                {lines.length === 0 && <tr><td colSpan="4" className="py-2 text-slate-500">Sin líneas.</td></tr>}
+                            </tbody>
+                        </table>
+                        <div className="flex justify-end mb-4">
+                            <div className="w-72 space-y-1">
+                                {calc.hasOverride && <div className="flex justify-between text-slate-500"><span>Importe calculado</span><span>{eur(calc.computedBase)}</span></div>}
+                                <div className="flex justify-between"><span>Base imponible{calc.hasOverride ? ' (acordada)' : ''}</span><span>{eur(calc.billedBase)}</span></div>
+                                <div className="flex justify-between"><span>IVA {num(calc.ivaRate)} %</span><span>{eur(calc.iva)}</span></div>
+                                <div className="flex justify-between font-black border-t border-slate-400 pt-1"><span>Total</span><span>{eur(calc.total)}</span></div>
+                            </div>
+                        </div>
+                        {calc.overLimit && <p className="text-rose-700 font-bold mb-3">⚠ Supera el presupuesto aceptado más averías ocultas aceptadas ({eur(calc.limit)}). El exceso no se puede cobrar (art. 16.7).</p>}
+                        {rejected.length > 0 && (
+                            <div className="mb-3">
+                                <p className="font-bold">Debe constar en la factura (art. 16.6): averías comunicadas y no aceptadas por el cliente</p>
+                                {rejected.map(h => <p key={h.id}>• {h.description} — comunicada el {fmtDate(h.communicated_date)}. Se recomienda su reparación.</p>)}
+                            </div>
+                        )}
+                        <div className="doc-legal space-y-1 border-t border-slate-300 pt-3">
+                            <p>• La factura se emite en el programa de facturación del taller. Debe ir firmada y sellada y desglosar operaciones, piezas, horas de trabajo e importe de cada concepto (RD 1457/1986, art. 15.1).</p>
+                            <p>• Garantía: 3 meses o 2.000 km desde la entrega{warrantyUntil ? ` (entrega ${fmtDate(order.delivery_date)}: hasta el ${fmtDate(warrantyUntil)})` : ''}.</p>
+                            <p>• Piezas sustituidas: {order.return_parts ? 'entregar al cliente' : 'el cliente renuncia a recibirlas'}.</p>
+                        </div>
+                    </>
+                );
+            }
+
+            const copy = async () => {
+                try { await navigator.clipboard.writeText(copyText); notify('Datos copiados. Pégalos en el programa de facturación.'); }
+                catch (e) { notify('No se ha podido copiar automáticamente. Selecciona el texto y cópialo a mano.', 'error'); }
+            };
+
+            return (
+                <div className="doc-overlay fixed inset-0 z-50 bg-slate-950/90 overflow-y-auto p-4">
+                    <div className="no-print max-w-[210mm] mx-auto mb-3 flex flex-wrap gap-2 justify-between items-center">
+                        <h2 className="font-bold text-white">{title} · {order.number}</h2>
+                        <div className="flex gap-2">
+                            {copyText && <button onClick={copy} className={btnSecondary}>📋 Copiar datos</button>}
+                            <button onClick={() => window.print()} className={btnPrimary}>🖨️ Imprimir / PDF</button>
+                            <button onClick={onClose} className={btnSecondary}>Cerrar</button>
+                        </div>
+                    </div>
+                    {missing.length > 0 && (
+                        <div className="no-print max-w-[210mm] mx-auto mb-3 bg-rose-500/15 border border-rose-500/40 text-rose-200 text-sm rounded-xl px-4 py-2">
+                            Faltan datos obligatorios: {missing.join(', ')}.
+                        </div>
+                    )}
+                    <div className="doc-sheet bg-white text-slate-900 max-w-[210mm] mx-auto rounded-xl shadow-2xl p-8 md:p-10">
+                        {body}
+                    </div>
+                </div>
+            );
+        }
+
+        function BudgetTable({ snap }) {
+            return (
+                <>
+                    <table className="w-full text-left border-collapse">
+                        <thead>
+                            <tr className="border-b-2 border-slate-400">
+                                <th className="py-2 pr-2">Concepto</th><th className="py-2 px-2 text-center">Cantidad</th>
+                                <th className="py-2 px-2 text-right">Precio ud. (sin IVA)</th><th className="py-2 pl-2 text-right">Importe</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-200">
+                            {snap.labor.length > 0 && <tr><td colSpan="4" className="pt-3 pb-1 font-bold text-[11px] uppercase text-slate-500">Mano de obra</td></tr>}
+                            {snap.labor.map((l, i) => (
+                                <tr key={'l' + i}><td className="py-1.5 pr-2">{l.desc}</td><td className="py-1.5 px-2 text-center">{num(l.hours)} h</td><td className="py-1.5 px-2 text-right">{eur(l.rate)}</td><td className="py-1.5 pl-2 text-right">{eur(l.amount)}</td></tr>
+                            ))}
+                            {snap.parts.length > 0 && <tr><td colSpan="4" className="pt-3 pb-1 font-bold text-[11px] uppercase text-slate-500">Recambios y materiales</td></tr>}
+                            {snap.parts.map((p, i) => (
+                                <tr key={'p' + i}><td className="py-1.5 pr-2">{p.desc}{p.brand ? ` (${p.brand})` : ''}</td><td className="py-1.5 px-2 text-center">{num(p.qty)}</td><td className="py-1.5 px-2 text-right">{eur(p.price)}</td><td className="py-1.5 pl-2 text-right">{eur(p.amount)}</td></tr>
+                            ))}
+                        </tbody>
+                    </table>
+                    <div className="flex justify-end mt-3 avoid-break">
+                        <div className="w-72 space-y-1">
+                            <div className="flex justify-between"><span>Total sin IVA</span><span>{eur(snap.base)}</span></div>
+                            <div className="flex justify-between"><span>IVA {num(snap.ivaRate)} %</span><span>{eur(snap.iva)}</span></div>
+                            <div className="flex justify-between font-black text-base border-t border-slate-400 pt-1"><span>TOTAL</span><span>{eur(snap.total)}</span></div>
+                        </div>
+                    </div>
+                </>
+            );
+        }
+
+        // =====================================================================
+        // CLIENTES Y VEHÍCULOS
+        // =====================================================================
+        function Clients({ db, api }) {
+            const [q, setQ] = useState('');
+            const query = q.trim().toLowerCase();
+            const list = db.clients.filter(c => {
+                if (!query) return true;
+                const plates = db.vehicles.filter(v => v.client_id === c.id).map(v => v.license_plate.toLowerCase());
+                return c.name.toLowerCase().includes(query) || (c.nif || '').toLowerCase().includes(query) || plates.some(p => p.includes(query));
+            });
+
+            const removeClient = (c) => {
+                if (db.vehicles.some(v => v.client_id === c.id)) { api.notify('Este cliente tiene vehículos. Elimínalos antes (solo se puede si no tienen órdenes).', 'error'); return; }
+                api.ask({ title: 'Eliminar cliente', danger: true, confirmLabel: 'Eliminar', message: `¿Eliminar a ${c.name}?`, onConfirm: () => api.del('clients', c.id) });
+            };
+            const removeVehicle = (v) => {
+                if (db.orders.some(o => o.vehicle_id === v.id)) { api.notify('Este vehículo tiene órdenes registradas y no se puede eliminar.', 'error'); return; }
+                api.ask({ title: 'Eliminar vehículo', danger: true, confirmLabel: 'Eliminar', message: `¿Eliminar el vehículo ${v.license_plate}?`, onConfirm: () => api.del('vehicles', v.id) });
+            };
+
+            return (
+                <div className="space-y-5 max-w-7xl mx-auto">
+                    <div className="flex flex-wrap gap-3 bg-slate-900 border border-slate-800 p-4 rounded-2xl">
+                        <input type="search" placeholder="Buscar cliente, NIF o matrícula…" value={q} onChange={(e) => setQ(e.target.value)} className={`${inputCls} flex-1 min-w-[220px]`} />
+                        <button onClick={() => api.setModal({ type: 'vehicle' })} className={btnSecondary} disabled={db.clients.length === 0}>+ Vehículo</button>
+                        <button onClick={() => api.setModal({ type: 'client' })} className={btnPrimary}>+ Cliente</button>
+                    </div>
+                    {list.length === 0 && <p className="text-sm text-slate-500">No hay clientes{query ? ' que coincidan' : ''}.</p>}
+                    <div className="grid md:grid-cols-2 gap-5">
+                        {list.map(c => (
+                            <Card key={c.id}>
+                                <div className="flex justify-between gap-3">
+                                    <div>
+                                        <h3 className="font-bold text-white">{c.name}</h3>
+                                        <p className="text-xs text-orange-400">NIF: {c.nif || '—'}</p>
+                                        <p className={`text-xs mt-1 ${c.address ? 'text-slate-400' : 'text-rose-400'}`}>{c.address || 'Falta domicilio'}</p>
+                                    </div>
+                                    <div className="text-right text-xs text-slate-400 space-y-0.5">
+                                        {c.phone && <p>📞 {c.phone}</p>}{c.email && <p>✉️ {c.email}</p>}
+                                    </div>
+                                </div>
+                                <div className="border-t border-slate-800 mt-3 pt-3 space-y-1.5">
+                                    {db.vehicles.filter(v => v.client_id === c.id).map(v => (
+                                        <div key={v.id} className="bg-slate-950 px-3 py-2 rounded-xl border border-slate-800 flex justify-between items-center gap-2 text-xs">
+                                            <span className="font-mono font-bold text-orange-400">{v.license_plate}</span>
+                                            <span className="text-slate-300 flex-1">{v.brand} {v.model} {v.year ? `(${v.year})` : ''}</span>
+                                            <button className="text-slate-400 hover:text-white underline" onClick={() => api.setModal({ type: 'vehicle', data: v })}>Editar</button>
+                                            <button className="text-slate-500 hover:text-rose-400" onClick={() => removeVehicle(v)} aria-label="Eliminar vehículo">✕</button>
+                                        </div>
+                                    ))}
+                                    <div className="flex gap-3 pt-1 text-xs">
+                                        <button className="text-orange-400 underline" onClick={() => api.setModal({ type: 'vehicle', data: { client_id: c.id } })}>+ Añadir vehículo</button>
+                                        <button className="text-slate-400 underline" onClick={() => api.setModal({ type: 'client', data: c })}>Editar cliente</button>
+                                        <button className="text-slate-500 hover:text-rose-400 underline ml-auto" onClick={() => removeClient(c)}>Eliminar</button>
+                                    </div>
+                                </div>
+                            </Card>
+                        ))}
+                    </div>
+                </div>
+            );
+        }
+
+        function ClientModal({ client, onClose, api }) {
+            const [f, setF] = useState({ name: '', nif: '', address: '', phone: '', email: '', ...(client || {}) });
+            const save = (e) => {
+                e.preventDefault();
+                if (!f.name.trim()) return;
+                const data = { name: f.name.trim(), nif: f.nif.trim().toUpperCase(), address: f.address.trim(), phone: f.phone.trim(), email: f.email.trim() };
+                if (client?.id) api.upd('clients', client.id, data); else api.add('clients', data);
+                onClose();
+            };
+            return (
+                <Modal title={client?.id ? 'Editar cliente' : 'Nuevo cliente'} onClose={onClose}>
+                    <form onSubmit={save} className="space-y-3">
+                        <Field label="Nombre o razón social *"><input required value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} className={inputCls} /></Field>
+                        <Field label="NIF / DNI" hint="Necesario para la factura completa"><input value={f.nif} onChange={(e) => setF({ ...f, nif: e.target.value })} className={inputCls} /></Field>
+                        <Field label="Domicilio" hint="Obligatorio en presupuesto y resguardo (art. 14)"><input value={f.address} onChange={(e) => setF({ ...f, address: e.target.value })} className={inputCls} /></Field>
+                        <div className="grid grid-cols-2 gap-3">
+                            <Field label="Teléfono"><input type="tel" value={f.phone} onChange={(e) => setF({ ...f, phone: e.target.value })} className={inputCls} /></Field>
+                            <Field label="Email"><input type="email" value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} className={inputCls} /></Field>
+                        </div>
+                        <div className="flex justify-end gap-3 pt-2"><button type="button" onClick={onClose} className={btnSecondary}>Cancelar</button><button type="submit" className={btnPrimary}>Guardar</button></div>
+                    </form>
+                </Modal>
+            );
+        }
+
+        function VehicleModal({ db, vehicle, onClose, api }) {
+            const [f, setF] = useState({ client_id: '', license_plate: '', brand: '', model: '', year: '', ...(vehicle || {}) });
+            const [error, setError] = useState('');
+            const save = (e) => {
+                e.preventDefault();
+                const plate = f.license_plate.trim().toUpperCase().replace(/\s+/g, ' ');
+                if (!f.client_id || !plate) return;
+                const norm = (p) => p.replace(/[\s-]/g, '');
+                if (db.vehicles.some(v => v.id !== vehicle?.id && norm(v.license_plate) === norm(plate))) { setError('Ya existe un vehículo con esa matrícula.'); return; }
+                const data = { client_id: f.client_id, license_plate: plate, brand: f.brand.trim(), model: f.model.trim(), year: f.year };
+                if (vehicle?.id) api.upd('vehicles', vehicle.id, data); else api.add('vehicles', data);
+                onClose();
+            };
+            return (
+                <Modal title={vehicle?.id ? 'Editar vehículo' : 'Nuevo vehículo'} onClose={onClose}>
+                    <form onSubmit={save} className="space-y-3">
+                        <Field label="Cliente *">
+                            <select required value={f.client_id} onChange={(e) => setF({ ...f, client_id: e.target.value })} className={inputCls}>
+                                <option value="">Selecciona cliente…</option>
+                                {db.clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                            </select>
+                        </Field>
+                        <Field label="Matrícula *"><input required value={f.license_plate} onChange={(e) => { setError(''); setF({ ...f, license_plate: e.target.value.toUpperCase() }); }} className={`${inputCls} font-mono`} placeholder="1234 ABC" /></Field>
+                        <div className="grid grid-cols-2 gap-3">
+                            <Field label="Marca"><input value={f.brand} onChange={(e) => setF({ ...f, brand: e.target.value })} className={inputCls} /></Field>
+                            <Field label="Modelo"><input value={f.model} onChange={(e) => setF({ ...f, model: e.target.value })} className={inputCls} /></Field>
+                        </div>
+                        <Field label="Año"><input type="number" min="1950" max="2100" value={f.year} onChange={(e) => setF({ ...f, year: e.target.value })} className={inputCls} /></Field>
+                        {error && <p className="text-sm text-rose-400">{error}</p>}
+                        <div className="flex justify-end gap-3 pt-2"><button type="button" onClick={onClose} className={btnSecondary}>Cancelar</button><button type="submit" className={btnPrimary}>Guardar</button></div>
+                    </form>
+                </Modal>
+            );
+        }
+
+        function OrderModal({ db, onClose, onSave, goClients }) {
+            const [f, setF] = useState({ vehicle_id: '', open_date: todayISO(), km: '', customer_request: '', deposit_for: 'presupuesto', expected_date: '', expected_days: '' });
+            const save = (e) => {
+                e.preventDefault();
+                if (!f.vehicle_id || !f.customer_request.trim()) return;
+                onSave({ ...f, customer_request: f.customer_request.trim() });
+                onClose();
+            };
+            if (db.vehicles.length === 0) {
+                return (
+                    <Modal title="Nueva orden" onClose={onClose}>
+                        <p className="text-sm text-slate-300">Primero da de alta al cliente y su vehículo.</p>
+                        <div className="flex justify-end gap-3 mt-5"><button className={btnSecondary} onClick={onClose}>Cancelar</button><button className={btnPrimary} onClick={goClients}>Ir a clientes</button></div>
+                    </Modal>
+                );
+            }
+            return (
+                <Modal title="Nueva orden de reparación" onClose={onClose} wide>
+                    <form onSubmit={save} className="grid md:grid-cols-2 gap-3">
+                        <Field label="Vehículo *" className="md:col-span-2">
+                            <select required value={f.vehicle_id} onChange={(e) => setF({ ...f, vehicle_id: e.target.value })} className={inputCls}>
+                                <option value="">Selecciona vehículo…</option>
+                                {db.vehicles.map(v => { const c = db.clients.find(c => c.id === v.client_id); return <option key={v.id} value={v.id}>{v.license_plate} · {v.brand} {v.model} · {c?.name || ''}</option>; })}
+                            </select>
+                        </Field>
+                        <Field label="Fecha de entrada *"><input type="date" required value={f.open_date} onChange={(e) => setF({ ...f, open_date: e.target.value })} className={inputCls} /></Field>
+                        <Field label="Kilómetros *"><input type="number" min="0" required value={f.km} onChange={(e) => setF({ ...f, km: e.target.value })} className={inputCls} /></Field>
+                        <Field label="Trabajo solicitado / avería *" className="md:col-span-2"><textarea required rows="2" value={f.customer_request} onChange={(e) => setF({ ...f, customer_request: e.target.value })} className={inputCls} /></Field>
+                        <Field label="El vehículo se deja para">
+                            <select value={f.deposit_for} onChange={(e) => setF({ ...f, deposit_for: e.target.value })} className={inputCls}>
+                                <option value="presupuesto">Elaborar presupuesto</option><option value="reparación">Reparación</option>
+                            </select>
+                        </Field>
+                        <Field label="Entrega prevista" hint="Del presupuesto o del vehículo"><input type="date" value={f.expected_date} onChange={(e) => setF({ ...f, expected_date: e.target.value })} className={inputCls} /></Field>
+                        <div className="md:col-span-2 flex justify-end gap-3 pt-2"><button type="button" onClick={onClose} className={btnSecondary}>Cancelar</button><button type="submit" className={btnPrimary}>Crear orden</button></div>
+                    </form>
+                </Modal>
+            );
+        }
+
+        // =====================================================================
+        // TRABAJADORES
+        // =====================================================================
+        function Workers({ db, api }) {
+            const [from, to] = monthRange();
+            const remove = (w) => {
+                if (db.tasks.some(t => t.worker_id === w.id)) {
+                    api.ask({
+                        title: 'No se puede eliminar', confirmLabel: 'Marcar como inactivo',
+                        message: `${w.name} tiene horas registradas en órdenes. Eliminarlo cambiaría los costes de órdenes ya cerradas. Se puede marcar como "Inactivo": deja de aparecer para nuevas tareas y se conserva el histórico.`,
+                        onConfirm: () => api.upd('workers', w.id, { status: 'Inactivo' }),
+                    });
+                    return;
+                }
+                api.ask({ title: 'Eliminar trabajador', danger: true, confirmLabel: 'Eliminar', message: `¿Eliminar a ${w.name}?`, onConfirm: () => api.del('workers', w.id) });
+            };
+            return (
+                <div className="space-y-5 max-w-7xl mx-auto">
+                    <div className="flex justify-between items-center bg-slate-900 border border-slate-800 p-4 rounded-2xl">
+                        <h2 className="text-lg font-bold text-white">Trabajadores</h2>
+                        <button onClick={() => api.setModal({ type: 'worker' })} className={btnPrimary}>+ Nuevo trabajador</button>
+                    </div>
+                    <p className="text-xs text-slate-500">El <strong>coste/hora</strong> es lo que le cuesta al taller cada hora del trabajador (salario bruto + Seguridad Social a cargo de la empresa + parte proporcional de vacaciones y horas no productivas). No es lo que se cobra al cliente. Pídeselo a la gestoría.</p>
+                    {db.workers.length === 0 && <p className="text-sm text-slate-500">No hay trabajadores.</p>}
+                    <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-5">
+                        {db.workers.map(w => {
+                            const monthHours = db.tasks.filter(t => t.worker_id === w.id).reduce((a, t) => {
+                                const o = db.orders.find(o => o.id === t.order_id);
+                                return o && o.close_date && o.close_date >= from && o.close_date <= to ? a + n(t.hours_real) : a;
+                            }, 0);
+                            const style = w.status === 'Activo' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' : w.status === 'Inactivo' ? 'bg-slate-700/40 text-slate-400 border-slate-600' : w.status === 'De vacaciones' ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' : 'bg-rose-500/10 text-rose-400 border-rose-500/20';
+                            return (
+                                <Card key={w.id}>
+                                    <div className="flex justify-between items-start">
+                                        <div>
+                                            <h3 className="font-bold text-white">{w.name}</h3>
+                                            <span className={`inline-block mt-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold border ${style}`}>● {w.status}</span>
+                                        </div>
+                                        <div className="flex gap-2 text-xs">
+                                            <button className="text-slate-400 hover:text-white underline" onClick={() => api.setModal({ type: 'worker', data: w })}>Editar</button>
+                                            <button className="text-slate-500 hover:text-rose-400" onClick={() => remove(w)}>🗑️</button>
+                                        </div>
+                                    </div>
+                                    <div className="border-t border-slate-800 mt-3 pt-3 text-sm space-y-1">
+                                        <Row label="Coste/hora" value={`${eur(w.cost_hour)}/h`} />
+                                        <Row label="Horas reales este mes" value={`${num(monthHours)} h`} />
+                                    </div>
+                                </Card>
+                            );
+                        })}
+                    </div>
+                </div>
+            );
+        }
+
+        function WorkerModal({ worker, onClose, api }) {
+            const [f, setF] = useState({ name: '', cost_hour: '', status: 'Activo', ...(worker || {}) });
+            const save = (e) => {
+                e.preventDefault();
+                if (!f.name.trim() || f.cost_hour === '') return;
+                const data = { name: f.name.trim(), cost_hour: n(f.cost_hour), status: f.status };
+                if (worker?.id) api.upd('workers', worker.id, data); else api.add('workers', data);
+                onClose();
+            };
+            return (
+                <Modal title={worker?.id ? 'Editar trabajador' : 'Nuevo trabajador'} onClose={onClose}>
+                    <form onSubmit={save} className="space-y-3">
+                        <Field label="Nombre *"><input required value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} className={inputCls} /></Field>
+                        <Field label="Coste/hora para el taller (€) *" hint="Salario + Seguridad Social de empresa, por hora trabajada"><input required type="number" step="0.01" min="0" value={f.cost_hour} onChange={(e) => setF({ ...f, cost_hour: e.target.value })} className={inputCls} /></Field>
+                        <Field label="Estado">
+                            <select value={f.status} onChange={(e) => setF({ ...f, status: e.target.value })} className={inputCls}>
+                                {WORKER_STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+                            </select>
+                        </Field>
+                        <div className="flex justify-end gap-3 pt-2"><button type="button" onClick={onClose} className={btnSecondary}>Cancelar</button><button type="submit" className={btnPrimary}>Guardar</button></div>
+                    </form>
+                </Modal>
+            );
+        }
+
+        // =====================================================================
+        // RENTABILIDAD / INFORMES
+        // =====================================================================
+        function Reports({ db, openOrder }) {
+            const [initFrom, initTo] = monthRange();
+            const [from, setFrom] = useState(initFrom);
+            const [to, setTo] = useState(initTo);
+
+            const rows = db.orders
+                .filter(o => CLOSED.includes(o.status) && o.close_date && o.close_date >= from && o.close_date <= to)
+                .sort((a, b) => a.close_date.localeCompare(b.close_date))
+                .map(o => ({ o, c: orderCalc(db, o.id), ...orderContext(db, o) }));
+            const t = rows.reduce((a, r) => ({
+                base: a.base + r.c.billedBase, iva: a.iva + r.c.iva, labor: a.labor + r.c.laborCost, parts: a.parts + r.c.partsCost,
+            }), { base: 0, iva: 0, labor: 0, parts: 0 });
+            const cost = t.labor + t.parts, profit = t.base - cost;
+
+            const byWorker = db.workers.map(w => {
+                const hours = rows.reduce((a, r) => a + db.tasks.filter(tk => tk.order_id === r.o.id && tk.worker_id === w.id).reduce((x, tk) => x + n(tk.hours_real), 0), 0);
+                return { w, hours };
+            }).filter(x => x.hours > 0);
+
+            return (
+                <div className="space-y-5 max-w-7xl mx-auto">
+                    <div className="bg-slate-900 border border-slate-800 p-4 rounded-2xl flex flex-wrap justify-between items-center gap-3">
+                        <h2 className="text-lg font-bold text-white">Rentabilidad</h2>
+                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                            <label className="text-slate-400">Desde <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className={`${inputCls} w-auto inline-block ml-1`} /></label>
+                            <label className="text-slate-400">Hasta <input type="date" value={to} onChange={(e) => setTo(e.target.value)} className={`${inputCls} w-auto inline-block ml-1`} /></label>
+                        </div>
+                    </div>
+                    <p className="text-xs text-slate-500">Incluye órdenes terminadas o entregadas con fecha de cierre en el periodo. Importes sin IVA. Es una estimación de gestión, no contabilidad: no incluye alquiler, suministros, herramientas ni otros gastos fijos.</p>
+                    <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                        <Kpi label="Facturable (base)" value={eur(t.base)} color="text-emerald-400" />
+                        <Kpi label="Costes directos" value={eur(cost)} color="text-rose-400" />
+                        <Kpi label="Beneficio directo" value={eur(profit)} color={profit >= 0 ? 'text-orange-400' : 'text-rose-400'} />
+                        <Kpi label="Margen" value={t.base > 0 ? `${num(profit / t.base * 100)} %` : '—'} />
+                    </div>
+                    <Card title={`Órdenes cerradas (${rows.length})`}>
+                        {rows.length === 0 ? <p className="text-sm text-slate-500">No hay órdenes cerradas en este periodo.</p> : (
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-sm min-w-[720px]">
+                                    <thead><tr className="text-left text-xs uppercase text-slate-400 border-b border-slate-800">
+                                        <th className="pb-2 px-2">Cierre</th><th className="pb-2 px-2">Orden</th><th className="pb-2 px-2">Matrícula</th><th className="pb-2 px-2">Cliente</th>
+                                        <th className="pb-2 px-2 text-right">Base</th><th className="pb-2 px-2 text-right">Coste</th><th className="pb-2 px-2 text-right">Beneficio</th>
+                                    </tr></thead>
+                                    <tbody className="divide-y divide-slate-800">
+                                        {rows.map(({ o, c, vehicle, client }) => (
+                                            <tr key={o.id} className="hover:bg-slate-800/40 cursor-pointer" onClick={() => openOrder(o.id)}>
+                                                <td className="py-2 px-2">{fmtDate(o.close_date)}</td><td className="py-2 px-2 font-bold">{o.number}</td>
+                                                <td className="py-2 px-2 font-mono text-orange-400">{vehicle?.license_plate}</td><td className="py-2 px-2">{client?.name}</td>
+                                                <td className="py-2 px-2 text-right">{eur(c.billedBase)}</td><td className="py-2 px-2 text-right">{eur(c.cost)}</td>
+                                                <td className={`py-2 px-2 text-right font-bold ${c.profit >= 0 ? 'text-orange-400' : 'text-rose-400'}`}>{eur(c.profit)}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+                        <p className="text-[11px] text-slate-500 mt-3">IVA repercutido en el periodo (informativo, se ingresa a Hacienda): {eur(t.iva)}. Coste mano de obra {eur(t.labor)} · coste recambios {eur(t.parts)}.</p>
+                    </Card>
+                    {byWorker.length > 0 && (
+                        <Card title="Horas reales por trabajador en el periodo">
+                            <div className="space-y-1 text-sm">{byWorker.map(({ w, hours }) => <Row key={w.id} label={w.name} value={`${num(hours)} h`} />)}</div>
+                        </Card>
+                    )}
+                </div>
+            );
+        }
+
+        // =====================================================================
+        // AJUSTES
+        // =====================================================================
+        function Settings({ db, api }) {
+            const s = db.settings;
+            const logoInput = useRef(null);
+            const importInput = useRef(null);
+            const set = (k) => (e) => api.setSettings({ [k]: e.target.value });
+
+            const onLogo = (e) => {
+                const f = e.target.files && e.target.files[0];
+                e.target.value = '';
+                if (!f) return;
+                if (!/^image\/(png|jpeg|webp|svg\+xml)$/.test(f.type)) { api.notify('Formato no admitido. Usa PNG, JPG, WEBP o SVG.', 'error'); return; }
+                if (f.size > 700 * 1024) { api.notify('El logo pesa demasiado (máximo 700 KB). Redúcelo antes de subirlo.', 'error'); return; }
+                const r = new FileReader();
+                r.onload = () => { api.setSettings({ logo: r.result }); api.notify('Logo actualizado.'); };
+                r.onerror = () => api.notify('No se ha podido leer el archivo.', 'error');
+                r.readAsDataURL(f);
+            };
+
+            const exportData = () => {
+                const blob = new Blob([JSON.stringify(db, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = `copia-taller-${todayISO()}.json`;
+                document.body.appendChild(a); a.click(); a.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+            };
+
+            const onImport = (e) => {
+                const f = e.target.files && e.target.files[0];
+                e.target.value = '';
+                if (!f) return;
+                const r = new FileReader();
+                r.onload = () => {
+                    try {
+                        const p = JSON.parse(r.result);
+                        if (!isValidDb(p)) throw new Error('formato');
+                        api.ask({
+                            title: 'Restaurar copia', danger: true, confirmLabel: 'Restaurar',
+                            message: `Se sustituirán TODOS los datos actuales por los de la copia (${p.orders.length} órdenes, ${p.clients.length} clientes).`,
+                            onConfirm: () => { api.setDb(normalize(p)); api.notify('Copia restaurada.'); },
+                        });
+                    } catch (err) { api.notify('El archivo no es una copia válida de esta aplicación.', 'error'); }
+                };
+                r.readAsText(f);
+            };
+
+            return (
+                <div className="space-y-5 max-w-3xl mx-auto">
+                    <Card title="Datos del taller" right={<span className="text-[11px] text-slate-500">Aparecen en presupuestos y resguardos</span>}>
+                        <div className="grid md:grid-cols-2 gap-4">
+                            <Field label="Nombre"><input value={s.name} readOnly className={inputCls} /></Field>
+                            <Field label="NIF"><input value="No aplicable · demostración" readOnly className={inputCls} /></Field>
+                            <Field label="Identificación del taller"><input value="No aplicable · demostración" readOnly className={inputCls} /></Field>
+                            <Field label="Domicilio"><input value="Dirección ficticia · España" readOnly className={inputCls} /></Field>
+                            <Field label="Teléfono"><input value="No disponible en la demo" readOnly className={inputCls} /></Field>
+                            <Field label="Email"><input value="No disponible en la demo" readOnly className={inputCls} /></Field>
+                        </div>
+                    </Card>
+
+                    <Card title="Logotipo">
+                        <div className="flex flex-wrap items-center gap-5">
+                            <div className="bg-white rounded-xl p-3"><Logo settings={s} className="w-40 h-28" /></div>
+                            <div className="space-y-2">
+                                <input ref={logoInput} type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" onChange={onLogo} className="hidden" />
+                                <button className={btnPrimary} onClick={() => logoInput.current.click()}>Cambiar logo</button>
+                                {s.logo && <button className={`${btnSecondary} ml-2`} onClick={() => api.setSettings({ logo: null })}>Volver al logo original</button>}
+                                <p className="text-[11px] text-slate-500">PNG con fondo transparente o SVG, máximo 700 KB. Sale en la aplicación y en los documentos impresos.</p>
+                            </div>
+                        </div>
+                    </Card>
+
+                    <Card title="Precios">
+                        <div className="grid md:grid-cols-3 gap-4">
+                            <Field label="Precio hora mano de obra (€ sin IVA)" hint="Lo que se cobra al cliente"><input type="number" step="0.01" min="0" value={s.hourRate} onChange={set('hourRate')} className={inputCls} /></Field>
+                            <Field label="IVA (%)"><input type="number" step="0.01" min="0" value={s.ivaRate} onChange={set('ivaRate')} className={inputCls} /></Field>
+                            <Field label="Validez del presupuesto (días hábiles)" hint="Mínimo legal: 12 (art. 14.1)">
+                                <input type="number" min="12" value={s.validityDays} onChange={set('validityDays')} onBlur={() => { if (n(s.validityDays) < 12) api.setSettings({ validityDays: 12 }); }} className={inputCls} />
+                            </Field>
+                        </div>
+                        <p className="text-[11px] text-slate-500 mt-3">Los días hábiles se cuentan de lunes a viernes, sin descontar festivos. Si cae un festivo en medio, la validez real es algo mayor.</p>
+                    </Card>
+
+                    <Card title="Copia de seguridad">
+                        <p className="text-sm text-slate-400 mb-3">Los datos se guardan <strong>solo en este navegador y en este ordenador</strong>. Si se borra el historial del navegador o se cambia de equipo, se pierden. Descarga una copia con frecuencia (por ejemplo, cada viernes) y guárdala fuera del ordenador.</p>
+                        <div className="flex flex-wrap gap-3">
+                            <button className={btnPrimary} onClick={exportData}>⬇️ Descargar copia</button>
+                            <input ref={importInput} type="file" accept="application/json,.json" onChange={onImport} className="hidden" />
+                            <button className={btnSecondary} onClick={() => importInput.current.click()}>⬆️ Restaurar copia</button>
+                        </div>
+                    </Card>
+
+                    <Card title="Zona de peligro">
+                        <button className={btnDanger} onClick={() => api.ask({
+                            title: 'Borrar todos los datos', danger: true, confirmLabel: 'Borrar todo',
+                            message: 'Se eliminarán todas las órdenes, clientes, vehículos y trabajadores. Se conservan los ajustes y el logo. Descarga antes una copia si la necesitas.',
+                            onConfirm: () => api.setDb(prev => emptyDb(prev.settings)),
+                        })}>Borrar todos los datos</button>
+                    </Card>
+                </div>
+            );
+        }
+
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
